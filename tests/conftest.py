@@ -1,9 +1,148 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# DeepSpeed Team
+
 # tests directory-specific settings - this file is run automatically by pytest before any tests are run
 
+import inspect
 import sys
-from os.path import abspath, dirname, join
+import pytest
+import os
+from os.path import abspath, dirname
+
+# NVIDIA containers can force TF32 before PyTorch reads its backend settings.
+# Correctness tests compare independent sharding/offload paths and require IEEE fp32.
+os.environ.pop("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", None)
+
+import torch
+import warnings
+
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
+# Set this environment variable for the T5 inference unittest(s) (e.g. google/t5-v1_1-small)
+os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
 
 # allow having multiple repository checkouts and not needing to remember to rerun
 # 'pip install -e .[dev]' when switching between checkouts and running tests.
-git_repo_path = abspath(join(dirname(dirname(__file__)), "src"))
+git_repo_path = abspath(dirname(dirname(__file__)))
 sys.path.insert(1, git_repo_path)
+
+
+def pytest_configure(config):
+    # Force color on for plain invocations, but keep an explicit --color
+    # choice: the CI nightlies pass --color=no so their logs parse cleanly.
+    if config.option.color == "auto":
+        config.option.color = "yes"
+    config.option.durations = 0
+    config.option.durations_min = 1
+    config.option.verbose = True
+
+
+def pytest_addoption(parser):
+    parser.addoption("--torch_ver", default=None, type=str)
+    parser.addoption("--cuda_ver", default=None, type=str)
+
+
+def validate_version(expected, found):
+    version_depth = expected.count('.') + 1
+    found = '.'.join(found.split('.')[:version_depth])
+    return found == expected
+
+
+@pytest.fixture(scope="session", autouse=True)
+def check_environment(pytestconfig):
+    expected_torch_version = pytestconfig.getoption("torch_ver")
+    expected_cuda_version = pytestconfig.getoption("cuda_ver")
+    if expected_torch_version is None:
+        warnings.warn(
+            "Running test without verifying torch version, please provide an expected torch version with --torch_ver")
+    elif not validate_version(expected_torch_version, torch.__version__):
+        pytest.exit(
+            f"expected torch version {expected_torch_version} did not match found torch version {torch.__version__}",
+            returncode=2)
+    if expected_cuda_version is None:
+        warnings.warn(
+            "Running test without verifying cuda version, please provide an expected cuda version with --cuda_ver")
+    elif not validate_version(expected_cuda_version, torch.version.cuda):
+        pytest.exit(
+            f"expected cuda version {expected_cuda_version} did not match found cuda version {torch.version.cuda}",
+            returncode=2)
+
+
+# Override of pytest "runtest" for DistributedTest class
+# This hook is run before the default pytest_runtest_call
+# The multi-rank-only CI workflow (DS_MULTIRANK_ONLY=1) spends its budget only on
+# the multi-rank tests its LOCAL_SIZE gate admits; single-rank tests are deselected
+# because the plain cpu-torch-latest run already guards them. Per-test world_size
+# marks are honored with the same precedence as the launcher (mark, then class
+# attribute); a fixture-injected world_size falls back to the class attribute.
+def pytest_collection_modifyitems(config, items):
+    if os.environ.get('DS_MULTIRANK_ONLY', '0') != '1':
+        return
+
+    def is_multirank(item):
+        cls = getattr(item, 'cls', None)
+        if not getattr(cls, 'is_dist_test', False):
+            return False
+        mark = item.get_closest_marker('world_size')
+        if mark is not None:
+            world_size = mark.args[0]
+        else:
+            world_size = getattr(cls, 'world_size', None)
+        if isinstance(world_size, (list, tuple)):
+            return any(ws > 1 for ws in world_size)
+        return isinstance(world_size, int) and world_size > 1
+
+    deselected = [item for item in items if not is_multirank(item)]
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = [item for item in items if is_multirank(item)]
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_call(item):
+    # We want to use our own launching function for distributed tests
+    if getattr(item.cls, "is_dist_test", False):
+        dist_test_class = item.cls()
+        dist_test_class(item._request)
+        item.runtest = lambda: True  # Dummy function so test is not run twice
+
+
+# We allow DistributedTest to reuse distributed environments. When the last
+# test for a class is run, we want to make sure those distributed environments
+# are destroyed.
+def pytest_runtest_teardown(item, nextitem):
+    if getattr(item.cls, "reuse_dist_env", False) and not nextitem:
+        dist_test_class = item.cls()
+        for num_procs, pool in dist_test_class._pool_cache.items():
+            dist_test_class._close_pool(pool, num_procs, force=True)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_pycollect_makeitem(collector, name, obj):
+    # Pytest 8 only registers FixtureFunctionDefinition objects. The
+    # _pytestfixturefunction marker on DistributedFixture is ignored, so a test
+    # that requests the class errors with "fixture not found" before the
+    # launcher can skip for an unavailable world size.
+    if not inspect.isclass(obj) or not getattr(obj, "is_dist_fixture", False):
+        return None
+    if obj.__name__ == "DistributedFixture":
+        return None
+
+    def _launch(request, fixture_cls=obj):
+        fixture_cls()(request)
+
+    _launch.__name__ = name
+    fixture_def = pytest.fixture(name=name)(_launch)
+    holder = type("_DistributedFixtureHolder", (), {name: fixture_def})
+    collector.session._fixturemanager.parsefactories(holder, nodeid=collector.nodeid)
+    return None
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_fixture_setup(fixturedef, request):
+    if getattr(fixturedef.func, "is_dist_fixture", False):
+        dist_fixture_class = fixturedef.func()
+        dist_fixture_class(request)

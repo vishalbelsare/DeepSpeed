@@ -1,8 +1,9 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// DeepSpeed Team
 
 /*
-Copyright 2020 The Microsoft DeepSpeed Team
-Licensed under the MIT license.
-
 Functionality for swapping optimizer tensors to/from (NVMe) storage devices.
 */
 
@@ -25,6 +26,7 @@ Functionality for swapping optimizer tensors to/from (NVMe) storage devices.
 #include <string>
 #include <vector>
 
+#include "deepspeed_aio_op_desc.h"
 #include "deepspeed_py_aio.h"
 
 using namespace std;
@@ -45,32 +47,38 @@ int deepspeed_py_aio_write(const torch::Tensor& buffer,
 {
     const auto start_time = std::chrono::high_resolution_clock::now();
     deepspeed_aio_config_t config(block_size, queue_depth, single_submit, overlap_events, false);
+    // Before the file is opened: the constructor throws if io_queue_init fails.
+    std::unique_ptr<aio_context> aio_ctxt(new aio_context(config._block_size, config._queue_depth));
 
     const auto fd = open_file(filename, false);
     if (fd == -1) { return -1; }
+    warn_consumer_ssd_writes();
 
     auto write_buffer = (char*)buffer.data_ptr();
-    const auto num_write_bytes = static_cast<long long int>(buffer.nbytes());
-    std::unique_ptr<io_xfer_ctxt> xfer_ctxt(new io_xfer_ctxt(fd, 0, num_write_bytes, write_buffer));
-    std::unique_ptr<aio_context> aio_ctxt(new aio_context(config._block_size, config._queue_depth));
+    const auto num_write_bytes = static_cast<int64_t>(buffer.nbytes());
 
-    if (config._overlap_events) {
-        do_aio_operation_overlap(false, aio_ctxt, xfer_ctxt, &config, nullptr);
-    } else {
-        do_aio_operation_sequential(false, aio_ctxt, xfer_ctxt, &config, nullptr);
-    }
+    std::unique_ptr<io_xfer_ctxt> xfer_ctxt(
+        new io_xfer_ctxt(fd, 0, 0, num_write_bytes, write_buffer));
+
+    const auto error_code =
+        config._overlap_events
+            ? do_aio_operation_overlap(false, aio_ctxt, xfer_ctxt, &config, nullptr)
+            : do_aio_operation_sequential(false, aio_ctxt, xfer_ctxt, &config, nullptr);
     const std::chrono::duration<double> aio_time =
         std::chrono::high_resolution_clock::now() - start_time;
 
     close(fd);
+    if (error_code != 0) {
+        report_file_error(filename, " write", -error_code);
+        return -1;
+    }
 
     if (validate) { validate_aio_operation(false, filename, write_buffer, num_write_bytes); }
 
     const std::chrono::duration<double> fn_time =
         std::chrono::high_resolution_clock::now() - start_time;
-    std::cout << "Elapsed time(usec): "
-              << "aio = " << aio_time.count() * 1e6 << " call = " << fn_time.count() * 1e6
-              << std::endl;
+    std::cout << "Elapsed time(usec): " << "aio = " << aio_time.count() * 1e6
+              << " call = " << fn_time.count() * 1e6 << std::endl;
     return 0;
 }
 
@@ -83,7 +91,7 @@ int deepspeed_py_aio_read(torch::Tensor& buffer,
                           const bool validate)
 {
     const auto start_time = std::chrono::high_resolution_clock::now();
-    long long num_file_bytes;
+    int64_t num_file_bytes;
     if (-1 == get_file_size(filename, num_file_bytes)) {
         const auto error_code = errno;
         report_file_error(filename, " fstat for read", error_code);
@@ -91,31 +99,35 @@ int deepspeed_py_aio_read(torch::Tensor& buffer,
     }
 
     deepspeed_aio_config_t config(block_size, queue_depth, single_submit, overlap_events, false);
+    // Before the file is opened: the constructor throws if io_queue_init fails.
+    std::unique_ptr<aio_context> aio_ctxt(new aio_context(config._block_size, config._queue_depth));
     const auto fd = open_file(filename, true);
     if (fd == -1) { return -1; }
 
     auto read_buffer = (char*)buffer.data_ptr();
-    assert(static_cast<long long int>(buffer.nbytes()) == num_file_bytes);
+    assert(static_cast<int64_t>(buffer.nbytes()) == num_file_bytes);
 
-    std::unique_ptr<io_xfer_ctxt> xfer_ctxt(new io_xfer_ctxt(fd, 0, num_file_bytes, read_buffer));
-    std::unique_ptr<aio_context> aio_ctxt(new aio_context(config._block_size, config._queue_depth));
+    std::unique_ptr<io_xfer_ctxt> xfer_ctxt(
+        new io_xfer_ctxt(fd, 0, 0, num_file_bytes, read_buffer));
 
-    if (config._overlap_events) {
-        do_aio_operation_overlap(true, aio_ctxt, xfer_ctxt, &config, nullptr);
-    } else {
-        do_aio_operation_sequential(true, aio_ctxt, xfer_ctxt, &config, nullptr);
-    }
+    const auto error_code =
+        config._overlap_events
+            ? do_aio_operation_overlap(true, aio_ctxt, xfer_ctxt, &config, nullptr)
+            : do_aio_operation_sequential(true, aio_ctxt, xfer_ctxt, &config, nullptr);
     const std::chrono::duration<double> aio_time =
         std::chrono::high_resolution_clock::now() - start_time;
 
     close(fd);
+    if (error_code != 0) {
+        report_file_error(filename, " read", -error_code);
+        return -1;
+    }
 
     if (validate) { validate_aio_operation(true, filename, read_buffer, num_file_bytes); }
 
     const std::chrono::duration<double> fn_time =
         std::chrono::high_resolution_clock::now() - start_time;
-    std::cout << "Elapsed time(usec): "
-              << "aio = " << aio_time.count() * 1e6 << " call = " << fn_time.count() * 1e6
-              << std::endl;
+    std::cout << "Elapsed time(usec): " << "aio = " << aio_time.count() * 1e6
+              << " call = " << fn_time.count() * 1e6 << std::endl;
     return 0;
 }

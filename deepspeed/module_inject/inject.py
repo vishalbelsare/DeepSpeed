@@ -1,32 +1,29 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# DeepSpeed Team
+
 import copy
 import torch
 from deepspeed.ops.transformer import DeepSpeedTransformerLayer, DeepSpeedTransformerConfig
 
 
-def module_inject(layer_obj,
-                  model,
-                  config,
-                  micro_batch_size,
-                  max_seq_length,
-                  seed,
-                  preln,
-                  fp16=True):
+def module_inject(layer_obj, model, config, micro_batch_size, max_seq_length, seed, preln, fp16=True):
     for name, child in model.named_children():
         if isinstance(child, layer_obj):
             print('REPLACING BertLayer')
 
-            cuda_config = DeepSpeedTransformerConfig(
-                batch_size=micro_batch_size,
-                max_seq_length=max_seq_length,
-                hidden_size=config.hidden_size,
-                heads=config.num_attention_heads,
-                attn_dropout_ratio=config.attention_probs_dropout_prob,
-                hidden_dropout_ratio=config.hidden_dropout_prob,
-                num_hidden_layers=config.num_hidden_layers,
-                initializer_range=config.initializer_range,
-                seed=seed,
-                fp16=fp16,
-                pre_layer_norm=preln)
+            cuda_config = DeepSpeedTransformerConfig(batch_size=micro_batch_size,
+                                                     max_seq_length=max_seq_length,
+                                                     hidden_size=config.hidden_size,
+                                                     heads=config.num_attention_heads,
+                                                     attn_dropout_ratio=config.attention_probs_dropout_prob,
+                                                     hidden_dropout_ratio=config.hidden_dropout_prob,
+                                                     num_hidden_layers=config.num_hidden_layers,
+                                                     initializer_range=config.initializer_range,
+                                                     seed=seed,
+                                                     fp16=fp16,
+                                                     pre_layer_norm=preln)
 
             new_module = DeepSpeedTransformerLayer(cuda_config)
 
@@ -69,14 +66,7 @@ def module_inject(layer_obj,
             setattr(model, name, copy.deepcopy(new_module))
 
         else:
-            module_inject(layer_obj,
-                          child,
-                          config,
-                          micro_batch_size,
-                          max_seq_length,
-                          seed,
-                          preln,
-                          fp16)
+            module_inject(layer_obj, child, config, micro_batch_size, max_seq_length, seed, preln, fp16)
 
     return model
 
@@ -103,20 +93,8 @@ def test_hi():
     bert_config = BertConfigPreLN(**bert_model_config)
     base_model = BertForQuestionAnsweringPreLN(bert_config, args=None)
 
-    #base_model = LinearStack()
-
     test_model = copy.deepcopy(base_model)
     test_model = module_inject(BertLayer, test_model, bert_config, 4, 384, 1234)
 
     print('BASE', base_model)
     print('TEST', test_model)
-
-    #base_model.eval()
-    #test_model.eval()
-
-    #test_input = torch.rand(1, base_model.input_dim)
-
-    #base_output = base_model(test_input)
-    #test_output = test_model(test_input)
-    #
-    #assert torch.allclose(base_output, test_output, atol=3e-8)

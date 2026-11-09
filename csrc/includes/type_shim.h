@@ -1,3 +1,8 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// DeepSpeed Team
+
 /* Taken from NVIDIA/apex commit 855808f3fc268e9715d613f3c2e56469d8c986d8 */
 #include <ATen/ATen.h>
 
@@ -102,7 +107,6 @@ reduce_block_into_lanes(T* x,
             final = x[tid] + x[tid + 32];
         else
             final = val;
-            // __SYNCWARP();
 
 #pragma unroll
         for (int i = 16; i >= lanes; i >>= 1)

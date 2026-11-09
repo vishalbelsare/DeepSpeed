@@ -1,40 +1,41 @@
-"""
-Copyright 2020 The Microsoft DeepSpeed Team
-Licensed under the MIT license.
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
 
+# DeepSpeed Team
+"""
 Functionality of swapping tensors to/from (NVMe) storage devices.
 """
 
-import os
 import torch
 from deepspeed.utils.logging import logger
 
-from deepspeed.runtime.swap_tensor.constants import AIO_BLOCK_SIZE, AIO_QUEUE_DEPTH, \
-    AIO_THREAD_COUNT, AIO_SINGLE_SUBMIT, AIO_OVERLAP_EVENTS
+from deepspeed import comm as dist
 
 MIN_AIO_BYTES = 1024**2
 AIO_ALIGNED_BYTES = 1024
+MIN_SWAPPABLE_BYTES = MIN_AIO_BYTES
 
 
 def swap_in_tensors(swap_handle, tensor_buffers, swap_paths):
     for buffer, path in zip(tensor_buffers, swap_paths):
-        assert (swap_handle.async_pread(buffer, path) == 0)
+        assert (swap_handle.async_pread(buffer, path, 0) == 0)
 
 
 def swap_out_tensors(swap_handle, tensor_buffers, swap_paths):
     for buffer, path in zip(tensor_buffers, swap_paths):
-        assert (swap_handle.async_pwrite(buffer, path) == 0)
+        assert (swap_handle.async_pwrite(buffer, path, 0) == 0)
 
 
 def print_object(obj, name, exclude_list=[]):
     logger.info('{}:'.format(name))
     for arg in sorted(vars(obj)):
-        if not arg in exclude_list:
+        if arg not in exclude_list:
             dots = '.' * (29 - len(arg))
             logger.info('  {} {} {}'.format(arg, dots, getattr(obj, arg)))
 
 
 class SwapBuffer(object):
+
     def __init__(self, buffer):
         self.buffer = buffer
         self.reset()
@@ -53,7 +54,7 @@ class SwapBuffer(object):
 
     def allocate_tensor(self, swap_path, numel, aligned_numel):
         assert self.has_space(aligned_numel)
-        assert not self.offset in self.swap_tensors
+        assert self.offset not in self.swap_tensors
 
         allocate_offset = self.offset
         swap_tensor = self.buffer.narrow(0, allocate_offset, aligned_numel)
@@ -93,8 +94,9 @@ class SwapBuffer(object):
 
 
 class SwapBufferPool(object):
-    def __init__(self, buffers):
-        assert all([buf.is_pinned() for buf in buffers])
+
+    def __init__(self, buffers, aio_handle):
+        assert all([aio_handle.is_pinned(buf) for buf in buffers])
         self.buffers = [SwapBuffer(buf) for buf in buffers]
         self.current_index = 0
 
@@ -176,22 +178,24 @@ class SwapBufferPool(object):
 
 
 class SwapBufferManager(object):
-    def __init__(self, num_elems, count, dtype):
+
+    def __init__(self, num_elems, count, dtype, aio_handle):
         self.num_elems = num_elems
         self.count = count
         self.dtype = dtype
-        self.all_buffers = [
-            torch.zeros(num_elems,
-                        device='cpu',
-                        dtype=dtype).pin_memory() for _ in range(count)
-        ]
+        # Keep the handle to release the page-locked buffers on teardown (see __del__).
+        self.aio_handle = aio_handle
+        # Zero-init: new_cpu_locked_tensor is backed by posix_memalign (uninitialized),
+        # but optimizer state (e.g. Adam momentum/variance) starts from these buffers and
+        # must be zeroed, matching the prior torch.zeros() allocation.
+        dtype_example = torch.zeros(1, device='cpu', dtype=dtype)
+        self.all_buffers = [aio_handle.new_cpu_locked_tensor(num_elems, dtype_example).zero_() for _ in range(count)]
         self.free_buffer_index = [i for i in range(count)]
         self.used_buffer_index = {}
-        self.gigabytes = (self.all_buffers[0].element_size() * num_elems * count) / (1024
-                                                                                     **3)
+        self.gigabytes = (self.all_buffers[0].element_size() * num_elems * count) / (1024**3)
 
-        if torch.distributed.get_rank() == 0:
-            exclude_list = ['all_buffers']
+        if dist.get_rank() == 0:
+            exclude_list = ['all_buffers', 'aio_handle']
             print_object(obj=self, name='SwapBufferManager', exclude_list=exclude_list)
 
     def allocate(self, num_elems, count, dtype):
@@ -211,9 +215,7 @@ class SwapBufferManager(object):
         return buffers
 
     def allocate_all(self, num_elems, dtype):
-        return self.allocate(num_elems=num_elems,
-                             count=len(self.free_buffer_index),
-                             dtype=dtype)
+        return self.allocate(num_elems=num_elems, count=len(self.free_buffer_index), dtype=dtype)
 
     def free(self, buffers):
         buffer_ids = []
@@ -225,6 +227,21 @@ class SwapBufferManager(object):
         for b_id in buffer_ids:
             self.free_buffer_index.append(self.used_buffer_index[b_id])
             del (self.used_buffer_index[b_id])
+
+    def __del__(self):
+        # The pinned-tensor manager is process-wide, so these page-locked buffers are
+        # not reclaimed when this manager is dropped; release them explicitly so that
+        # repeatedly building NVMe swappers does not accumulate locked memory.
+        all_buffers = getattr(self, 'all_buffers', None)
+        if not all_buffers:
+            return
+        for buf in all_buffers:
+            try:
+                self.aio_handle.free_cpu_locked_tensor(buf)
+            except Exception:
+                # Best-effort cleanup; the handle may already be gone at shutdown.
+                pass
+        self.all_buffers = []
 
 
 def get_sized_buffer(buffer, num_elems):

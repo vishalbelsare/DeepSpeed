@@ -1,5 +1,6 @@
 ---
 title: "Learning Rate Range Test"
+tags: training learning-rate
 ---
 This tutorial shows how to use to perform Learning Rate range tests in PyTorch.
 
@@ -53,7 +54,7 @@ schedule that:
 ### PyTorch
 
 For PyTorch models, LRRT is implemented as a [learning rate
-scheduler](https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html),
+scheduler](https://docs.pytorch.org/docs/stable/optim.html),
 a feature that is available in PyTorch versions 1.0.1 and newer. Thus, you can
 add a `"scheduler"` entry of type `"LRRangeTest"` into your model configuration
 as illustrated below:
@@ -80,7 +81,7 @@ larger batch sizes, as we scaled from one GPU (batch size 512) to four GPUs
 to match the performance of the smaller batch size using the same amount of
 data samples. The challenge here is the well known problem of slow convergence
 of large batch size training. Our approach was to use a
-[1Cycle](/tutorials/1Cycle/) schedule in DeepSpeed to tackle
+[1Cycle](/tutorials/one-cycle/) schedule in DeepSpeed to tackle
 this problem, and we used LRRT to configure the schedule.
 
 In the plots below, we illustrate using LRRT to discover the maximum learning
@@ -136,7 +137,7 @@ In our experience these are four most critical parameters of 1Cycle schedules.
 1. We chose to use the slower LRRT schedule (`lr_range_test_step_rate=5`) to
 set `cycle_min_lr` because it achieves the best loss and the faster schedule
 diverges fairly quickly.
-2. We set `cycle_min_lr` to 0.005 even though the plot shows that performance
+2. We set `cycle_max_lr` to 0.005 even though the plot shows that performance
 was still improving at slightly higher learning rate. This is because we
 observed that if we wait till the maximum learning rate, the model could be at
 the point of divergence and impossible to recover.

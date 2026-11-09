@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e
 err_report() {
@@ -121,7 +121,7 @@ rm_if_exist() {
     if [ -f $1 ]; then
         rm $VERBOSE $1
     elif [ -d $1 ]; then
-        rm -r $VERBOSE $1
+        rm -rf $VERBOSE $1
     fi
 }
 
@@ -152,11 +152,11 @@ if [ ! -f $hostfile ]; then
 fi
 
 echo "Building deepspeed wheel"
-python setup.py $VERBOSE bdist_wheel
+python -m build $VERBOSE --wheel --no-isolation
 
 if [ "$local_only" == "1" ]; then
     echo "Installing deepspeed"
-    $PIP_SUDO pip uninstall -y deepspeed
+#    $PIP_SUDO pip uninstall -y deepspeed
     $PIP_SUDO $PIP_INSTALL dist/deepspeed*.whl
     ds_report
 else

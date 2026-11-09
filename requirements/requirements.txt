@@ -1,7 +1,11 @@
-torch
-tqdm
+einops
+hjson
+msgpack
 ninja
 numpy
+packaging>=20.0
 psutil
-packaging
-hjson
+py-cpuinfo
+pydantic>=2.0.0
+torch>=2.0.0
+tqdm

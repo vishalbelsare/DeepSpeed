@@ -1,4 +1,7 @@
-# Copyright 2020 The Microsoft DeepSpeed Team
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# DeepSpeed Team
 """
 DeepSpeed runner is the main front-end to launching multi-worker
 training jobs with DeepSpeed. By default this uses pdsh to parallel
@@ -7,6 +10,7 @@ per rank for training.
 """
 
 import os
+import re
 import sys
 import json
 import base64
@@ -14,27 +18,35 @@ import argparse
 import subprocess
 import collections
 from copy import deepcopy
+import signal
+import time
+from typing import Tuple, List, Dict
+from collections import defaultdict
+import shlex
 
-import torch.cuda
-
-from .multinode_runner import PDSHRunner, OpenMPIRunner, MVAPICHRunner
-from .constants import PDSH_LAUNCHER, OPENMPI_LAUNCHER, MVAPICH_LAUNCHER
+from .multinode_runner import PDSHRunner, OpenMPIRunner, MVAPICHRunner, SlurmRunner, MPICHRunner, IMPIRunner
+from .constants import PDSH_LAUNCHER, OPENMPI_LAUNCHER, MVAPICH_LAUNCHER, SLURM_LAUNCHER, MPICH_LAUNCHER, IMPI_LAUNCHER
 from ..constants import TORCH_DISTRIBUTED_DEFAULT_PORT
-from ..utils import logger
+from ..utils import logger, set_log_level_from_string
 
 from ..autotuning import Autotuner
+from deepspeed.accelerator import get_accelerator
 
 DLTS_HOSTFILE = "/job/hostfile"
-EXPORT_ENVS = ["NCCL", "PYTHON", "MV2", 'UCX']
-DEEPSPEED_ENVIRONMENT_NAME = ".deepspeed_env"
+EXPORT_ENVS = ['MLFLOW', 'PYTHON', 'MV2', 'UCX']
+DEEPSPEED_ENVIRONMENT_NAME = os.getenv("DS_ENV_FILE", ".deepspeed_env")
 DEEPSPEED_ENVIRONMENT_PATHS = [os.path.expanduser("~"), '.']
 PDSH_MAX_FAN_OUT = 1024
 
+# On AISC compute, each node sets environment variables independently, want to prevent
+# exporting rank-0 env variables in case of heterogeneous compute.
+EXCLUDE_ENVS = {'AISC_JOB_NAME': ['NCCL_IB_HCA', 'UCX_NET_DEVICES']}
+
 
 def parse_args(args=None):
-    parser = argparse.ArgumentParser(
-        description="DeepSpeed runner to help launch distributed "
-        "multi-node/multi-gpu training jobs.")
+    parser = argparse.ArgumentParser(description="DeepSpeed runner to help launch distributed "
+                                     "multi-node/multi-gpu training jobs.",
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument("-H",
                         "--hostfile",
@@ -76,6 +88,7 @@ def parse_args(args=None):
                         "the top N hosts from the given hostfile.")
 
     parser.add_argument("--num_gpus",
+                        "--num_accelerators",
                         type=int,
                         default=-1,
                         help="Max number of GPUs to use on each node, will use "
@@ -93,11 +106,17 @@ def parse_args(args=None):
                         help="(optional) IP address of node 0, will be "
                         "inferred via 'hostname -I' if not specified.")
 
+    parser.add_argument("--node_rank",
+                        default=-1,
+                        type=int,
+                        help="ID of each node in the range [0:N). "
+                        "Only required when --no_ssh is set.")
+
     parser.add_argument("--launcher",
                         default=PDSH_LAUNCHER,
                         type=str,
                         help="(optional) choose launcher backend for multi-node "
-                        "training. Options currently include PDSH, OpenMPI, MVAPICH.")
+                        "training. Options currently include PDSH, OpenMPI, MVAPICH, SLURM, MPICH, IMPI.")
 
     parser.add_argument("--launcher_args",
                         default="",
@@ -105,25 +124,88 @@ def parse_args(args=None):
                         help="(optional) pass launcher specific arguments as a "
                         "single quoted argument.")
 
+    parser.add_argument("--module",
+                        action="store_true",
+                        help="Change each process to interpret the launch "
+                        "script as a Python module, executing with the same "
+                        "behavior as 'python -m'.")
+
+    parser.add_argument("--no_python",
+                        action="store_true",
+                        help="Skip prepending the training script with "
+                        "'python' - just execute it directly.")
+
+    parser.add_argument("--no_local_rank",
+                        action="store_true",
+                        help="Do not pass local_rank as an argument when calling "
+                        "the user's training script.")
+
+    parser.add_argument("--no_ssh",
+                        action="store_true",
+                        help="Launch training independently on each node without ssh setup.")
+
+    parser.add_argument("--no_ssh_check",
+                        action="store_true",
+                        help="Do not perform ssh check in multi-node launcher model")
+
     parser.add_argument("--force_multi",
                         action="store_true",
                         help="Force multi-node launcher mode, helps in cases where user "
                         "wants to launch on single remote node.")
 
-    parser.add_argument(
-        "--autotuning",
-        default="",
-        choices=["tune",
-                 "run"],
-        type=str,
-        help="Run DeepSpeed autotuner to discover optimal configuration parameters "
-        "before running job.")
+    parser.add_argument("--save_pid",
+                        action="store_true",
+                        help="Save file containing launcher process id (pid) at /tmp/<main-pid>.ds, "
+                        "where <main-pid> is the pid of the first process that invoked `deepspeed`. "
+                        "Useful when launching deepspeed processes programmatically.")
 
-    parser.add_argument("user_script",
+    parser.add_argument("--enable_each_rank_log",
+                        default="None",
                         type=str,
-                        help="User script to launch, followed by any required "
+                        help="redirect the stdout and stderr from each rank into different log files")
+
+    parser.add_argument("--autotuning",
+                        default="",
+                        choices=["tune", "run"],
+                        type=str,
+                        help="Run DeepSpeed autotuner to discover optimal configuration parameters "
+                        "before running job.")
+
+    parser.add_argument("user_script", type=str, help="User script to launch, followed by any required "
                         "arguments.")
+
     parser.add_argument('user_args', nargs=argparse.REMAINDER)
+
+    parser.add_argument("--bind_cores_to_rank",
+                        action="store_true",
+                        help="Bind each rank to different cores of the host")
+
+    parser.add_argument("--bind_core_list",
+                        type=str,
+                        default=None,
+                        help="List of cores to bind to with comma separated list of "
+                        "numbers and range. i.e. 1,3-5,7 => [1,3,4,5,7].  When not "
+                        "specified, all cores on system would be used rank binding")
+
+    parser.add_argument("--ssh_port", type=int, default=None, help="SSH port to use for remote connections")
+
+    parser.add_argument("--venv_script",
+                        type=str,
+                        default=None,
+                        help="Python virtual environment activation script for job.")
+
+    # TODOV1: change the default to 'warning'
+    parser.add_argument("--log_level",
+                        type=str,
+                        default="info",
+                        choices=['debug', 'info', 'warning', 'error', 'critical'],
+                        help="Set runner loglevel. The default is 'info'")
+
+    parser.add_argument("-q",
+                        "--quiet",
+                        action="store_true",
+                        help="Try to be as quiet as possible. Aliases to `--log_level error`")
+
     return parser.parse_args(args=args)
 
 
@@ -135,27 +217,76 @@ def fetch_hostfile(hostfile_path):
 
     # e.g., worker-0 slots=16
     with open(hostfile_path, 'r') as fd:
-        resource_pool = collections.OrderedDict()
-        for line in fd.readlines():
-            line = line.strip()
-            if line == '':
-                # skip empty lines
-                continue
-            try:
-                hostname, slots = line.split()
-                _, slot_count = slots.split("=")
-                slot_count = int(slot_count)
-            except ValueError as err:
-                logger.error("Hostfile is not formatted correctly, unable to "
-                             "proceed with training.")
-                raise err
-            if hostname in resource_pool:
-                logger.error("Hostfile contains duplicate hosts, unable to "
-                             "proceed with training.")
-                raise ValueError(f"host {hostname} is already defined")
-            resource_pool[hostname] = slot_count
+        hostfile_text = fd.readlines()
+
+    return _parse_hostfile(hostfile_text)
+
+
+def _parse_hostfile(hostfile_lines):
+    # Regex matches one or more non-whitespace characters (\S+) at the start of
+    # the line, followed by one or more whitespace characters (\s+), followed
+    # by the string "slots=", followed by one or more digits (\d+).
+    pattern = r'^(\S+)\s+slots=(\d+)'
+
+    resource_pool = collections.OrderedDict()
+
+    for line in hostfile_lines:
+        line = line.strip()
+        match = re.search(pattern, line)
+        if line.startswith("#") or line == "":
+            # hostfile comment or empty line, ignore
+            continue
+        elif match:
+            host = match.group(1)
+            num_slots = int(match.group(2))
+            if host in resource_pool:
+                logger.error(f"Bad hostfile text: {hostfile_lines}")
+                raise ValueError(f"Hostfile contains multiple entries for {host}, unable to proceed with launching")
+            resource_pool[host] = num_slots
+        else:
+            logger.error(f"Bad hostfile text: {hostfile_lines}")
+            raise ValueError(f"Hostfile contains a bad entry: {line}, unable to proceed with launching")
+
+    if len(resource_pool) == 0:
+        logger.error(f"Bad hostfile text: {hostfile_lines}")
+        raise ValueError("Hostfile is empty or not formatted correctly, unable to proceed with launching.")
 
     return resource_pool
+
+
+def _stable_remove_duplicates(data):
+    # Create a new list in the same order as original but with duplicates
+    # removed, should never be more than ~16 elements so simple is best
+    new_list = []
+    for x in data:
+        if x not in new_list:
+            new_list.append(x)
+    return new_list
+
+
+def parse_node_config(node_config: str) -> Tuple[str, List[int]]:
+    SLOT_LIST_START = ':'
+    SLOT_SEP = ','
+
+    if SLOT_LIST_START not in node_config:
+        return node_config, []
+
+    hostname, slots = node_config.split(SLOT_LIST_START)
+    slots = [int(x) for x in slots.split(SLOT_SEP)]
+
+    return hostname, slots
+
+
+def parse_node_config_list(node_config_list: List[str]) -> Dict[str, List[int]]:
+    NODE_SEP = '@'
+
+    node_configs = defaultdict(list)
+
+    for node_config in node_config_list.split(NODE_SEP):
+        hostname, slots = parse_node_config(node_config)
+        node_configs[hostname] += slots
+
+    return {k: sorted(list(set(v))) for k, v in node_configs.items()}
 
 
 def parse_resource_filter(host_info, include_str="", exclude_str=""):
@@ -171,11 +302,6 @@ def parse_resource_filter(host_info, include_str="", exclude_str=""):
         exclude_str="worker-1:0" will use all available resources except
           slot 0 on worker-1.
     '''
-
-    # Constants that define our syntax
-    NODE_SEP = '@'
-    SLOT_LIST_START = ':'
-    SLOT_SEP = ','
 
     # Ensure include/exclude are mutually exclusive
     if (include_str != "") and (exclude_str != ""):
@@ -194,12 +320,9 @@ def parse_resource_filter(host_info, include_str="", exclude_str=""):
         parse_str = exclude_str
 
     # foreach node in the list
-    for node_config in parse_str.split(NODE_SEP):
+    for hostname, slots in parse_node_config_list(parse_str).items():
         # Node can either be alone or node:slot,slot,slot
-        if SLOT_LIST_START in node_config:
-            hostname, slots = node_config.split(SLOT_LIST_START)
-            slots = [int(x) for x in slots.split(SLOT_SEP)]
-
+        if len(slots) > 0:
             # sanity checks
             if hostname not in host_info:
                 raise ValueError(f"Hostname '{hostname}' not found in hostfile")
@@ -217,7 +340,6 @@ def parse_resource_filter(host_info, include_str="", exclude_str=""):
 
         # User just specified the whole node
         else:
-            hostname = node_config
             # sanity check hostname
             if hostname not in host_info:
                 raise ValueError(f"Hostname '{hostname}' not found in hostfile")
@@ -231,7 +353,7 @@ def parse_resource_filter(host_info, include_str="", exclude_str=""):
     del_keys = []
     for hostname in filtered_hosts:
         # Remove duplicates
-        filtered_hosts[hostname] = list(set(filtered_hosts[hostname]))
+        filtered_hosts[hostname] = _stable_remove_duplicates(filtered_hosts[hostname])
         # Remove empty hosts
         if len(filtered_hosts[hostname]) == 0:
             del_keys.append(hostname)
@@ -249,13 +371,39 @@ def parse_resource_filter(host_info, include_str="", exclude_str=""):
 
 
 def parse_inclusion_exclusion(resource_pool, inclusion, exclusion):
+    # Hand parse_resource_filter what the machines actually have. Seeding this
+    # from the inclusion string instead made it filter the request against
+    # itself, so a bare hostname resolved to no slots and an out-of-range slot
+    # passed the check it exists to fail.
     active_resources = collections.OrderedDict()
     for hostname, slots in resource_pool.items():
         active_resources[hostname] = list(range(slots))
 
-    return parse_resource_filter(active_resources,
-                                 include_str=inclusion,
-                                 exclude_str=exclusion)
+    return parse_resource_filter(active_resources, include_str=inclusion, exclude_str=exclusion)
+
+
+def apply_num_nodes_and_gpus(active_resources, num_nodes, num_gpus):
+    """Trim resolved resources to the top num_nodes hosts and num_gpus slots per host.
+
+    Split out of main() so the launcher backends can be exercised against the same
+    resource dict main() hands them. Both flags are mutually exclusive with
+    --include/--exclude, which main() enforces before calling this.
+    """
+    if num_nodes > 0:
+        updated_active_resources = collections.OrderedDict()
+        for count, hostname in enumerate(active_resources.keys()):
+            if num_nodes == count:
+                break
+            updated_active_resources[hostname] = active_resources[hostname]
+        active_resources = updated_active_resources
+
+    if num_gpus > 0:
+        updated_active_resources = collections.OrderedDict()
+        for hostname in active_resources.keys():
+            updated_active_resources[hostname] = list(range(num_gpus))
+        active_resources = updated_active_resources
+
+    return active_resources
 
 
 def encode_world_info(world_info):
@@ -272,29 +420,44 @@ def run_autotuning(args, active_resources):
     tuner.print_tuning_results()
 
     logger.info("[End] Running autotuning")
+    tuner.write_optimal_config()
 
     if args.autotuning == "run":
         tuner.run_after_tuning()
 
 
+LAUNCHER_CLASSES = {
+    PDSH_LAUNCHER: PDSHRunner,
+    OPENMPI_LAUNCHER: OpenMPIRunner,
+    MPICH_LAUNCHER: MPICHRunner,
+    IMPI_LAUNCHER: IMPIRunner,
+    MVAPICH_LAUNCHER: MVAPICHRunner,
+    SLURM_LAUNCHER: SlurmRunner,
+}
+
+
 def main(args=None):
     args = parse_args(args)
 
+    if args.quiet:
+        args.log_level = "error"
+    set_log_level_from_string(args.log_level)
+
     resource_pool = fetch_hostfile(args.hostfile)
 
-    # respect CUDA_VISIBLE_DEVICES for a single node and no explicit resource filters
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    if not resource_pool and len(cuda_visible_devices):
-        detected_str = f"Detected CUDA_VISIBLE_DEVICES={cuda_visible_devices}"
-        if len(args.include) or len(
-                args.exclude) or args.num_nodes > 1 or args.num_gpus > 0:
+    # respect VISIBLE_DEVICES for a single node and no explicit resource filters
+    visible_devices_env = get_accelerator().visible_devices_envs()[0]
+    visible_devices = os.environ.get(visible_devices_env, "")
+    if not resource_pool and len(visible_devices):
+        detected_str = f"Detected VISIBLE_DEVICES={visible_devices}"
+        if len(args.include) or len(args.exclude) or args.num_nodes > 1 or args.num_gpus > 0:
             print(
                 f"{detected_str} but ignoring it because one or several of --include/--exclude/--num_gpus/--num_nodes cl args were used. If you want to use CUDA_VISIBLE_DEVICES don't pass any of these arguments to deepspeed."
             )
         else:
-            args.include = f"localhost:{cuda_visible_devices}"
+            args.include = f"localhost:{visible_devices}"
             print(f"{detected_str}: setting --include={args.include}")
-        del os.environ["CUDA_VISIBLE_DEVICES"]
+        del os.environ[visible_devices_env]
 
     if args.num_nodes >= 0 or args.num_gpus >= 0:
         if args.include != "" or args.exclude != "":
@@ -303,7 +466,7 @@ def main(args=None):
     multi_node_exec = True
     if not resource_pool:
         resource_pool = {}
-        device_count = torch.cuda.device_count()
+        device_count = get_accelerator().device_count()
         if device_count == 0:
             raise RuntimeError("Unable to proceed, no GPU resources available")
         resource_pool['localhost'] = device_count
@@ -313,52 +476,91 @@ def main(args=None):
     if not multi_node_exec and args.num_nodes > 1:
         raise ValueError("Num nodes is >1 but no extra nodes available via hostfile")
 
-    active_resources = parse_inclusion_exclusion(resource_pool,
-                                                 args.include,
-                                                 args.exclude)
-
+    active_resources = parse_inclusion_exclusion(resource_pool, args.include, args.exclude)
     env = os.environ.copy()
 
-    if not args.master_addr:
+    # validate that passwordless-ssh is workly properly with this hostfile
+    if multi_node_exec and not args.no_ssh_check and not args.no_ssh:
         first_host = list(active_resources.keys())[0]
-        hostname_cmd = [f"ssh {first_host} hostname -I"]
-        result = subprocess.check_output(hostname_cmd, shell=True)
+        try:
+            ssh_check_cmd = ("ssh -o PasswordAuthentication=no " +
+                             (f"-p {args.ssh_port} " if args.ssh_port is not None else "") + f"{first_host} hostname")
+            safe_ssh_cmd = shlex.split(ssh_check_cmd)
+            subprocess.check_call(safe_ssh_cmd, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            raise RuntimeError(
+                f"Using hostfile at {args.hostfile} but host={first_host} was not reachable via ssh. If you are running with a single node please remove {args.hostfile} or setup passwordless ssh."
+            )
+
+    if not args.master_addr:
+        assert multi_node_exec
+        first_host = list(active_resources.keys())[0]
+        ssh_check_cmd = "ssh "
+        if args.ssh_port is not None:
+            ssh_check_cmd += f" -p {args.ssh_port}"
+        ssh_check_cmd += f" {first_host} hostname -I"
+        hostname_cmd = shlex.split(ssh_check_cmd)
+        try:
+            result = subprocess.check_output(hostname_cmd)
+        except subprocess.CalledProcessError as err:
+            logger.error(
+                "Unable to detect suitable master address via 'hostname -I', please manually specify one via --master_addr"
+            )
+            raise err
         args.master_addr = result.decode('utf-8').split()[0]
+        if not args.master_addr:
+            raise RuntimeError(
+                "Unable to detect suitable master address via `hostname -I`, please manually specify one via --master_addr"
+            )
         logger.info(f"Using IP address of {args.master_addr} for node {first_host}")
 
     if args.autotuning != "":
         run_autotuning(args, active_resources)
         return
 
-    if args.num_nodes > 0:
-        updated_active_resources = collections.OrderedDict()
-        for count, hostname in enumerate(active_resources.keys()):
-            if args.num_nodes == count:
-                break
-            updated_active_resources[hostname] = active_resources[hostname]
-        active_resources = updated_active_resources
+    active_resources = apply_num_nodes_and_gpus(active_resources, args.num_nodes, args.num_gpus)
 
-    if args.num_gpus > 0:
-        updated_active_resources = collections.OrderedDict()
-        for hostname in active_resources.keys():
-            updated_active_resources[hostname] = list(range(args.num_gpus))
-        active_resources = updated_active_resources
+    # A filter can leave a single host, which takes the local-launch path below and never
+    # builds the backend, so ask the requested launcher about the filter while both paths
+    # are still on the table. Backends that can express any filter do nothing here.
+    launcher_cls = LAUNCHER_CLASSES.get(args.launcher.lower())
+    if launcher_cls is not None:
+        launcher_cls.validate_active_resources(active_resources)
+
+    if args.no_ssh:
+        assert (0 <= args.node_rank <
+                len(active_resources)), "Launching training without ssh, but --node_rank is not set correctly."
 
     # encode world info as base64 to make it easier to pass via command line
     world_info_base64 = encode_world_info(active_resources)
 
-    multi_node_exec = args.force_multi or len(active_resources) > 1
+    multi_node_exec = (args.force_multi or len(active_resources) > 1) and not args.no_ssh
 
     if not multi_node_exec:
         deepspeed_launch = [
-            sys.executable,
-            "-u",
-            "-m",
-            "deepspeed.launcher.launch",
-            f"--world_info={world_info_base64}",
-            f"--master_addr={args.master_addr}",
-            f"--master_port={args.master_port}"
+            sys.executable, "-u", "-m", "deepspeed.launcher.launch", f"--world_info={world_info_base64}",
+            f"--master_addr={args.master_addr}", f"--master_port={args.master_port}"
         ]
+        if args.no_ssh:
+            deepspeed_launch.append(f"--node_rank={args.node_rank}")
+        if args.no_python:
+            deepspeed_launch.append("--no_python")
+        if args.module:
+            deepspeed_launch.append("--module")
+        if args.no_local_rank:
+            deepspeed_launch.append("--no_local_rank")
+        if args.save_pid:
+            deepspeed_launch += ["--save_pid", f"{os.getpid()}"]
+        if args.enable_each_rank_log:
+            deepspeed_launch.append(f"--enable_each_rank_log={args.enable_each_rank_log}")
+        if args.bind_cores_to_rank:
+            deepspeed_launch.append("--bind_cores_to_rank")
+        if args.bind_core_list is not None:
+            deepspeed_launch.append(f"--bind_core_list={args.bind_core_list}")
+        if args.quiet:
+            deepspeed_launch.append("--quiet")
+        deepspeed_launch.append(f"--log_level={args.log_level}")
+
         cmd = deepspeed_launch + [args.user_script] + args.user_args
     else:
         args.launcher = args.launcher.lower()
@@ -366,8 +568,14 @@ def main(args=None):
             runner = PDSHRunner(args, world_info_base64)
         elif args.launcher == OPENMPI_LAUNCHER:
             runner = OpenMPIRunner(args, world_info_base64, resource_pool)
+        elif args.launcher == MPICH_LAUNCHER:
+            runner = MPICHRunner(args, world_info_base64, resource_pool)
+        elif args.launcher == IMPI_LAUNCHER:
+            runner = IMPIRunner(args, world_info_base64, resource_pool)
         elif args.launcher == MVAPICH_LAUNCHER:
             runner = MVAPICHRunner(args, world_info_base64, resource_pool)
+        elif args.launcher == SLURM_LAUNCHER:
+            runner = SlurmRunner(args, world_info_base64, resource_pool)
         else:
             raise NotImplementedError(f"Unknown launcher {args.launcher}")
 
@@ -380,23 +588,49 @@ def main(args=None):
         else:
             env['PYTHONPATH'] = curr_path
 
-        exports = ""
+        excluded_vars = []
+        for exclude_key, var_list in EXCLUDE_ENVS.items():
+            if exclude_key in env.keys():
+                # key exists in launcher env -> var list should be used
+                excluded_vars += var_list
+
+        # load envs from accelerator
+        exports = EXPORT_ENVS + get_accelerator().export_envs()
         for var in env.keys():
-            if any([var.startswith(name) for name in EXPORT_ENVS]):
-                runner.add_export(var, env[var])
+            if any([var.startswith(name) for name in exports]):
+                if not any([var == name for name in excluded_vars]):
+                    runner.add_export(var, env[var])
 
         for environ_path in DEEPSPEED_ENVIRONMENT_PATHS:
             environ_file = os.path.join(environ_path, DEEPSPEED_ENVIRONMENT_NAME)
             if os.path.isfile(environ_file):
+                logger.info(f"deepspeed_env file = {environ_file}")
                 with open(environ_file, 'r') as fd:
                     for var in fd.readlines():
-                        key, val = var.split('=')
+                        key, val = var.split('=', maxsplit=1)
                         runner.add_export(key, val)
 
-        cmd = runner.get_cmd(env, active_resources)
+        if args.launcher == PDSH_LAUNCHER:
+            cmd, kill_cmd, env = runner.get_cmd(env, active_resources)
+        else:
+            cmd = runner.get_cmd(env, active_resources)
 
     logger.info(f"cmd = {' '.join(cmd)}")
     result = subprocess.Popen(cmd, env=env)
+
+    def sigkill_handler(signum, frame):
+        result.send_signal(signal.SIGINT)
+        time.sleep(0.1)
+        result.send_signal(signal.SIGTERM)
+        result_kill = subprocess.Popen(kill_cmd, env=env)
+        result_kill.wait()
+        time.sleep(1)
+        sys.exit(1)
+
+    if args.launcher == PDSH_LAUNCHER and multi_node_exec:
+        signal.signal(signal.SIGINT, sigkill_handler)
+        signal.signal(signal.SIGTERM, sigkill_handler)
+
     result.wait()
 
     # In case of failure must propagate the error-condition back to the caller (usually shell). The

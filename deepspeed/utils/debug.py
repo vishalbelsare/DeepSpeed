@@ -1,19 +1,81 @@
-""" debug utils """
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
 
-import fcntl
+# DeepSpeed Team
+
+import weakref
+
+import deepspeed.comm as dist
+
+# For lazy import with printflock()
+fcntl = None
+
+
+class WeakIdNameMap:
+    """Maps modules and parameters to their names without keeping them alive.
+
+    These maps are module-level and are only reset in ``destroy()``, so with strong keys
+    they pin the snapshotted model for the life of the process. Anything that replaces a
+    submodule afterwards -- expert-parallel replacement, kernel injection -- leaves the
+    replaced weights resident even though nothing else references them.
+
+    ``weakref.WeakKeyDictionary`` cannot be used: its keys are ``weakref.ref`` objects
+    whose ``__eq__`` forwards to the referents, and comparing two live parameters yields a
+    tensor rather than a bool. Keying on ``id()`` and dropping the entry from a finalizer
+    keeps the identity semantics the previous dicts had.
+    """
+
+    def __init__(self):
+        self._names = {}
+        self._finalizers = {}
+
+    def __setitem__(self, obj, name):
+        key = id(obj)
+        self._names[key] = name
+        # Replacing an entry whose object is still alive would otherwise leak its finalizer.
+        finalizer = self._finalizers.pop(key, None)
+        if finalizer is not None:
+            finalizer.detach()
+        self._finalizers[key] = weakref.finalize(obj, self._discard, key)
+
+    def _discard(self, key):
+        self._names.pop(key, None)
+        self._finalizers.pop(key, None)
+
+    def __getitem__(self, obj):
+        return self._names[id(obj)]
+
+    def __contains__(self, obj):
+        return id(obj) in self._names
+
+    def __len__(self):
+        return len(self._names)
+
+    def clear(self):
+        for finalizer in self._finalizers.values():
+            finalizer.detach()
+        self._names.clear()
+        self._finalizers.clear()
+
 
 # for debug purposes map module and param objects to their fully qualified names
-module_names = {}
-param_names = {}
+module_names = WeakIdNameMap()
+param_names = WeakIdNameMap()
+
+
+def debug_clear_module_and_param_names():
+    module_names.clear()
+    param_names.clear()
 
 
 def debug_extract_module_and_param_names(model):
     # extract the fully qualified names as soon as the model is acquired
-    global module_names
-    global param_names
+    debug_clear_module_and_param_names()
     # XXX: can probably make a map of param2module and vice-versa
-    module_names = {module: name for name, module in model.named_modules()}
-    param_names = {param: name for name, param in model.named_parameters()}
+    for name, module in model.named_modules():
+        module_names[module] = name
+    for name, param in model.named_parameters():
+        param_names[param] = name
 
 
 def debug_module2name(module):
@@ -24,7 +86,7 @@ def debug_module2name(module):
 
 
 def debug_module2name_id(module):
-    return f"name={debug_module2name(module)} id={module.id}"
+    return f"name={debug_module2name(module)}"
 
 
 def debug_module2name_class(module):
@@ -38,24 +100,38 @@ def debug_param2name(param):
         return "unknown"
 
 
+def ds_id(param):
+    if hasattr(param, "ds_id"):
+        return param.ds_id
+    else:
+        return "none"
+
+
+def ds_shape(param):
+    if hasattr(param, "ds_shape"):
+        return param.ds_shape
+    else:
+        return param.shape
+
+
 def debug_param2name_id(param):
-    return f"name={debug_param2name(param)} id={param.ds_id}"
+    return f"name={debug_param2name(param)} id={ds_id(param)}"
 
 
 def debug_param2name_id_shape(param):
-    return f"name={debug_param2name(param)} id={param.ds_id} shape={param.data.shape}"
+    return f"name={debug_param2name(param)} id={ds_id(param)} shape={ds_shape(param)}"
 
 
 def debug_param2name_id_shape_device(param):
-    return f"name={debug_param2name(param)} id={param.ds_id} shape={param.data.shape} device={param.device}"
+    return f"name={debug_param2name(param)} id={ds_id(param)} shape={ds_shape(param)} device={param.device}"
 
 
 def debug_param2name_id_numel(param):
-    return f"name={debug_param2name(param)} id={param.ds_id} numel={param.numel()}"
+    return f"name={debug_param2name(param)} id={ds_id(param)} numel={param.numel()}"
 
 
 def debug_param2name_id_shape_status(param):
-    return f"name={debug_param2name(param)} id={param.ds_id} shape={param.data.shape} status={param.ds_status}"
+    return f"name={debug_param2name(param)} id={ds_id(param)} shape={ds_shape(param)} status={param.ds_status}"
 
 
 def printflock(*msgs):
@@ -69,7 +145,7 @@ def printflock(*msgs):
     2. Override the usual versions with ::
 
         def print_rank_0(message, debug=False, force=False):
-            rank = torch.distributed.get_rank()
+            rank = deepspeed.comm.get_rank()
             printflock(f"[{rank}] {message}")
     3. run the program and you get both logs non-interleaved
 
@@ -78,6 +154,9 @@ def printflock(*msgs):
     then compare those.
 
     """
+    global fcntl
+    if fcntl is None:
+        import fcntl
 
     with open(__file__, "r") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
@@ -100,7 +179,7 @@ def log_rank_file(rank, *msgs):
     2. Override the usual versions of print_rank_0 in those files with ::
 
         def print_rank_0(message, debug=False, force=False):
-            rank = torch.distributed.get_rank()
+            rank = deepspeed.comm.get_rank()
             log_rank_file(rank, message)
 
     3. run the program
@@ -123,6 +202,7 @@ def log_rank_file(rank, *msgs):
 
 
 def print_backward_tensors(tensor):
+
     def _print_bwd_tensors(grad_fn):
         print(f"Backward tensors in {grad_fn}")
         for funcs in grad_fn.next_functions:
@@ -130,11 +210,27 @@ def print_backward_tensors(tensor):
                 try:
                     tensor = getattr(funcs[0], 'variable')
                     print(funcs[0])
-                    print(
-                        f"Tensor - id: {id(tensor)}, shape: {tensor.shape}, data: {tensor}, grad: {tensor.grad}"
-                    )
+                    print(f"Tensor - id: {id(tensor)}, shape: {tensor.shape}, data: {tensor}, grad: {tensor.grad}")
                 except AttributeError as e:
                     _print_bwd_tensors(funcs[0])
 
     if hasattr(tensor, 'grad_fn'):
         _print_bwd_tensors(tensor.grad_fn)
+
+
+def print_rank(*msg, force=False):
+    """print something on all global ranks with [rank] prefix.
+    """
+    if not force:
+        return
+    global_rank = dist.get_rank()
+    print(f"[{global_rank}]", *msg)
+
+
+def print_rank0(*msg, force=False):
+    """print something only on rank 0"""
+    if not force:
+        return
+    global_rank = dist.get_rank()
+    if global_rank == 0:
+        print(f"[{global_rank}]", *msg)

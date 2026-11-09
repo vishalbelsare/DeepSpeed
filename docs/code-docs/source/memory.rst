@@ -7,9 +7,9 @@ API To Estimate Memory Usage
 
 ZeRO2:
 
-.. autofunction:: deepspeed.runtime.zero.stage2.estimate_zero2_model_states_mem_needs_all_live
+.. autofunction:: deepspeed.runtime.zero.stage_1_and_2.estimate_zero2_model_states_mem_needs_all_live
 
-.. autofunction:: deepspeed.runtime.zero.stage2.estimate_zero2_model_states_mem_needs_all_cold
+.. autofunction:: deepspeed.runtime.zero.stage_1_and_2.estimate_zero2_model_states_mem_needs_all_cold
 
 Examples:
 
@@ -18,15 +18,16 @@ Let's try a 3B model with just 1 node with 8 gpus, using live model:
 .. code-block:: bash
 
     python -c 'from transformers import AutoModel; \
-    from deepspeed.runtime.zero.stage2 import estimate_zero2_model_states_mem_needs_all_live; \
+    from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem_needs_all_live; \
     model = AutoModel.from_pretrained("t5-3b"); \
     estimate_zero2_model_states_mem_needs_all_live(model, num_gpus_per_node=8, num_nodes=1)'
+
     Estimated memory needed for params, optim states and gradients for a:
     HW: Setup with 1 node, 8 GPUs per node.
     SW: Model with 2851M total params.
       per CPU  |  per GPU |   Options
-      127.48GB |   5.31GB | cpu_offload=1
-      127.48GB |  15.93GB | cpu_offload=0
+      127.48GB |   5.31GB | offload_optimizer=cpu
+      127.48GB |  15.93GB | offload_optimizer=none
 
 Now, without the actual model, which requires us to know ``total_params`` and
 ``largest_layer_params``, but we got those from the run above, so future estimators are now much
@@ -34,14 +35,15 @@ faster as we don't need to load the model.
 
 .. code-block:: bash
 
-    python -c 'from deepspeed.runtime.zero.stage2 import estimate_zero2_model_states_mem_needs_all_cold; \
+    python -c 'from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem_needs_all_cold; \
     estimate_zero2_model_states_mem_needs_all_cold(total_params=2851e6, num_gpus_per_node=8, num_nodes=1)'
+
     Estimated memory needed for params, optim states and gradients for a:
     HW: Setup with 1 node, 8 GPUs per node.
     SW: Model with 2851M total params.
       per CPU  |  per GPU |   Options
-      127.45GB |   5.31GB | cpu_offload=1
-      127.45GB |  15.93GB | cpu_offload=0
+      127.45GB |   5.31GB | offload_optimizer=cpu
+      127.45GB |  15.93GB | offload_optimizer=none
 
 There is a slight difference due to rounding - the actual live model has a few more params
 
@@ -67,12 +69,12 @@ Let's try a 3B model with just 1 node with 8 gpus, using live model:
     HW: Setup with 1 node, 8 GPUs per node.
     SW: Model with 2851M total params, 32M largest layer params.
       per CPU  |  per GPU |   Options
-       71.71GB |   0.12GB | cpu_offload=1, cpu_offload_params=1, zero_init=1
-      127.48GB |   0.12GB | cpu_offload=1, cpu_offload_params=1, zero_init=0
-       63.74GB |   0.79GB | cpu_offload=1, cpu_offload_params=0, zero_init=1
-      127.48GB |   0.79GB | cpu_offload=1, cpu_offload_params=0, zero_init=0
-        1.47GB |   6.10GB | cpu_offload=0, cpu_offload_params=0, zero_init=1
-      127.48GB |   6.10GB | cpu_offload=0, cpu_offload_params=0, zero_init=0
+       71.71GB |   0.12GB | offload_param=cpu , offload_optimizer=cpu , zero_init=1
+      127.48GB |   0.12GB | offload_param=cpu , offload_optimizer=cpu , zero_init=0
+       63.74GB |   0.79GB | offload_param=none, offload_optimizer=cpu , zero_init=1
+      127.48GB |   0.79GB | offload_param=none, offload_optimizer=cpu , zero_init=0
+        1.47GB |   6.10GB | offload_param=none, offload_optimizer=none, zero_init=1
+      127.48GB |   6.10GB | offload_param=none, offload_optimizer=none, zero_init=0
 
 Now, without the actual model, which requires us to know ``total_params`` and
 ``largest_layer_params``, but we got those from the run above, so future estimators are now much
@@ -87,12 +89,12 @@ faster as we don't need to load the model.
     HW: Setup with 1 node, 8 GPUs per node.
     SW: Model with 2851M total params, 32M largest layer params.
       per CPU  |  per GPU |   Options
-       71.69GB |   0.12GB | cpu_offload=1, cpu_offload_params=1, zero_init=1
-      127.45GB |   0.12GB | cpu_offload=1, cpu_offload_params=1, zero_init=0
-       63.72GB |   0.78GB | cpu_offload=1, cpu_offload_params=0, zero_init=1
-      127.45GB |   0.78GB | cpu_offload=1, cpu_offload_params=0, zero_init=0
-        1.43GB |   6.09GB | cpu_offload=0, cpu_offload_params=0, zero_init=1
-      127.45GB |   6.09GB | cpu_offload=0, cpu_offload_params=0, zero_init=0
+       71.69GB |   0.12GB | offload_param=cpu , offload_optimizer=cpu , zero_init=1
+      127.45GB |   0.12GB | offload_param=cpu , offload_optimizer=cpu , zero_init=0
+       63.72GB |   0.78GB | offload_param=none, offload_optimizer=cpu , zero_init=1
+      127.45GB |   0.78GB | offload_param=none, offload_optimizer=cpu , zero_init=0
+        1.43GB |   6.09GB | offload_param=none, offload_optimizer=none, zero_init=1
+      127.45GB |   6.09GB | offload_param=none, offload_optimizer=none, zero_init=0
 
 There is a slight difference due to rounding - the actual live model has a few more params
 
@@ -263,24 +265,24 @@ Note about gradients: While gradients are stored in fp16 (2 bytes), during the w
 
 **Pinned Memory**
 
-Pinned general RAM is included in normal general RAM allocations (i.e. this is not extra memory allocations but simply shows how much of the general RAM is pinned)
+Pinned general RAM is included in normal general RAM allocations (i.e. this is not extra memory allocations but simply shows how much of the general RAM is pinned). Pinning is controlled by the ``pin_memory`` field of ``offload_optimizer`` / ``offload_param`` (both default to ``true``); set to ``false`` on hosts with tight memlock limits (``ulimit -l``). See :ref:`host-memory-pinning` for how host memory is page-locked (``torch`` vs ``native`` backends).
 
-* ZeRO-2: can't be controlled
+* ZeRO-1/2: controlled by ``offload_optimizer.pin_memory`` (fp32 master weights / gradients and related offload scratch buffers may be pinned on the host)
 
-* ZeRO-3
+* ZeRO-3 with ``offload_param.pin_memory=true``: partitioned fp16/bf16 parameter buffers on CPU may also be pinned.
 
-To enable add: ``"cpu_offload_use_pin_memory" : true``
+With pinning enabled on ZeRO-3 there are 2 sub-cases:
 
-Now there are 2 sub-cases:
-
-1. ``"cpu_offload_params": true``:
+1. ``offload_param`` enabled (``device: cpu``):
 
    - 6 * params (2b for fp16 params + 4b for fp32 gradients)
    - if ``gradient_accumulation_steps > 1`` an additional 2b for fp16 gradients are pinned
 
-2. ``"cpu_offload_params": false``:
+2. ``offload_param`` not enabled:
 
    - 4b for fp32 gradients
+
+Exact pinned volume also depends on gradient-accumulation and other offload scratch buffers.
 
 
 **Activation Memory**
@@ -288,3 +290,174 @@ Now there are 2 sub-cases:
 XXX: For Transformers is probably around (2* seq * attn_heads + 16 * hidden_size) * sequence * batch/gpu
 
 This needs to be completed.
+
+
+.. _host-memory-pinning:
+
+Host Memory Pinning
+-----------------------
+
+DeepSpeed page-locks (pins) host memory so DMA engines can move data efficiently
+between CPU RAM and accelerators or NVMe. All pinning goes through the accelerator
+APIs:
+
+.. code-block:: python
+
+    from deepspeed.accelerator import get_accelerator
+
+    pinned = get_accelerator().pin_memory(tensor)          # default: copy + match shape
+    assert get_accelerator().is_pinned(pinned)
+    get_accelerator().unpin_memory(pinned)                # no-op for the torch backend
+
+``pin_memory`` accepts ``make_copy`` and ``match_shape`` (both default ``True``) so
+callers can either allocate a shaped copy of ``tensor`` or obtain a flat locked
+buffer for later filling. With ``make_copy=False`` the input is only a
+shape/dtype template: both backends page-lock a fresh buffer and never read
+``tensor``, so scratch destinations do not pay for a second full-size
+allocation and a copy.
+
+Empty scratch buffers should use ``pin_empty`` / ``pin_empty_like`` instead of
+``pin_memory(torch.empty(...), make_copy=False)``. Those helpers take a shape
+and dtype only, so neither backend allocates a full-size pageable template.
+
+.. code-block:: python
+
+    scratch = get_accelerator().pin_empty_like(src, device='cpu')
+    scratch = get_accelerator().pin_empty(1024, dtype=torch.float32, device='cpu')
+
+Pin on/off vs backend
+=====================
+
+Whether to pin and how to pin are orthogonal:
+
+* **On/off:** ``zero_optimization.offload_*.pin_memory`` (ZeRO CPU offload),
+  ``use_pin_memory`` on eager activation checkpoint offload
+  (``CheckpointHiddenStatesOffload``), and
+  ``compile.offload_activation_pin_memory`` (DeepCompile activation offload).
+  All default to pinning so async copies can use full DMA bandwidth; set
+  false only under tight memlock limits (``ulimit -l``).
+* **How:** ``DS_PIN_MEMORY_BACKEND=torch|native`` (environment only; not a
+  ``ds_config`` field). Every call site that pins through
+  ``get_accelerator().pin_memory()`` honors this env var, including ZeRO
+  CPU-offload buffers and eager activation checkpoint offload. Keep the default
+  ``torch`` backend for activation offload: ``native`` is ``mlock`` without
+  ``cudaHostRegister``, so its host buffers are not registered for accelerator
+  DMA and the offload's async copies can still block. DeepCompile activation
+  offload pins with ATen ``pinned_memory`` and does **not** use
+  ``DS_PIN_MEMORY_BACKEND``.
+
+Backend Selection
+=================
+
+Whether to pin ZeRO CPU/NVMe offload buffers is controlled by
+``zero_optimization.offload_param.pin_memory`` /
+``zero_optimization.offload_optimizer.pin_memory`` (both default ``true``).
+That is independent of **how** pages are locked.
+
+The pinning **backend** (Torch vs DeepSpeed native) is selected only with the
+``DS_PIN_MEMORY_BACKEND`` environment variable (default ``torch``). There is
+no ``ds_config`` field for the backend.
+
+The ``torch`` backend page-locks host memory for **accelerator DMA**
+(``cudaHostRegister`` / device-specific pin). The ``native`` backend
+page-locks via ``posix_memalign`` + ``mlock`` for AIO/GDS (DeepNVMe can
+skip bounce buffers) and does **not** register the allocation with CUDA/XPU,
+so async GPU copies to native-pinned tensors can still block. Both are
+counted by ``track_pinned_memory`` when pages are actually locked. Differences:
+
+.. list-table:: Differences between ``torch`` and ``native`` pin backends
+   :header-rows: 1
+   :widths: 22 39 39
+
+   * - Aspect
+     - ``torch`` (default)
+     - ``native``
+   * - Allocator
+     - ``torch.Tensor.pin_memory()`` (device-specific accelerator hook)
+     - DeepNVMe page-locked allocator (``posix_memalign`` + ``mlock``) via pin_memory;
+       registered with the CUDA runtime by default for asynchronous DMA
+   * - Selection
+     - ``DS_PIN_MEMORY_BACKEND`` unset or ``torch``
+     - ``DS_PIN_MEMORY_BACKEND=native``
+   * - Build dependency
+     - None beyond the active accelerator / PyTorch
+     - DeepSpeed **pin_memory** op must build and load; fails early if unavailable (no silent fallback)
+   * - ``pin_memory`` extras
+     - Honors ``make_copy`` and ``match_shape`` (both default ``True``)
+     - Honors ``make_copy`` and ``match_shape`` (both default ``True``)
+   * - ``pin_empty`` / ``pin_empty_like``
+     - Host scratch allocation (cpu ``device``, required ``dtype``); no pageable template
+     - Same helper; native ``mlock`` via ``pin_empty``
+   * - Pin recognition (``is_pinned``)
+     - Torch pinned status (``tensor.is_pinned()``)
+     - ``.ds_pinned`` and process-wide pointer ranges (slices/views included)
+   * - ``unpin_memory``
+     - No-op (returns ``None``)
+     - Frees the mlocked allocation immediately (returns ``True`` on success)
+   * - Lifetime / free
+     - Freed when the tensor is garbage-collected (PyTorch)
+     - ``weakref`` finalizer frees on GC; prefer explicit ``unpin_memory`` for long-lived buffers (e.g. ZeRO ``destroy()``)
+   * - CPU accelerator
+     - Historical no-op (torch cannot pin CPU tensors); accounting skipped
+     - Real ``mlock`` pins; accounting applies
+
+Example:
+
+.. code-block:: bash
+
+    export DS_PIN_MEMORY_BACKEND=native
+    deepspeed train.py ...
+
+Native device registration
+==========================
+
+Native allocations are device-independent ``mlock`` buffers. DeepSpeed
+additionally registers them with the device through the accelerator's
+host-memory registration hook, so PyTorch can use them for asynchronous
+H2D/D2H DMA. Accelerators declare the alignment required for registered host
+memory via ``pin_memory_alignment``; native buffers are rounded down and
+size-padded to it before registration. Device registration is enabled by
+default and can be disabled for comparison or debugging:
+
+.. code-block:: bash
+
+    export DS_PIN_MEMORY_BACKEND=native
+    export DS_PIN_MEMORY_REGISTER_DEVICE=0  # mlock only; default is 1
+
+``DS_PIN_MEMORY_REGISTER_DEVICE`` accepts ``1``/``0``, ``true``/``false``,
+``yes``/``no``, and ``on``/``off``. Accelerators without a registration hook
+continue to use the device-independent ``mlock`` buffer. If registration fails,
+DeepSpeed logs a warning and retains the valid ``mlock`` allocation for CPU and
+AIO use.
+
+Requirements for native
+=======================
+
+* The DeepSpeed **pin_memory** op must build and load successfully. If
+  ``pin_memory`` cannot be constructed, selecting ``native`` fails early rather
+  than silently falling back to ``torch``.
+* The process must be allowed to lock the requested host memory (see
+  ``ulimit -l`` / ``memlock`` limits). Large ZeRO CPU-offload footprints can
+  otherwise hit the memlock ceiling.
+
+Lifetime and unpinning (native)
+================================
+
+Native-pinned allocations are tracked by a process-wide manager. Lifetime
+matches ``torch.pin_memory`` as closely as possible:
+
+* Dropping the returned tensor frees the locked pages via a ``weakref``
+  finalizer (no explicit unpin required for short-lived buffers).
+* Prefer ``get_accelerator().unpin_memory(tensor)`` when you know a buffer is
+  finished, so mlocked memory is released immediately instead of waiting on
+  garbage collection. ZeRO / ZenFlow optimizers do this for their owned
+  CPU-offload buffers in ``destroy()``.
+* After ``unpin_memory``, the tensor storage must not be used (use-after-free).
+* Unlike the torch pinned allocator, native allocations are **not** stream
+  tracked: they are freed as soon as the last reference drops, even if an
+  asynchronous copy is still reading them. Code that issues
+  ``non_blocking=True`` copies out of a native-pinned buffer must keep a
+  reference to it until it synchronizes.
+
+``is_pinned`` reports ``True`` for both torch-pinned tensors and native-managed
+buffers, including slices/views whose storage falls inside a managed range.

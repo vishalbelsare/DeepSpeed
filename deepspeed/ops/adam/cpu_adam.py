@@ -1,24 +1,23 @@
-'''
-Copyright 2020 The Microsoft DeepSpeed Team
-'''
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
 
-import math
+# DeepSpeed Team
+
 import torch
-import time
-from pathlib import Path
-from ..op_builder import CPUAdamBuilder
+from deepspeed.utils import logger
 from deepspeed.utils.logging import should_log_le
+from deepspeed.ops.cpu_optimizer import DeepSpeedCPUOptimizer
+from deepspeed.ops.op_builder import CPUAdamBuilder
 
 
-class DeepSpeedCPUAdam(torch.optim.Optimizer):
+class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
     optimizer_id = 0
 
     def __init__(self,
                  model_params,
                  lr=1e-3,
                  bias_correction=True,
-                 betas=(0.9,
-                        0.999),
+                 betas=(0.9, 0.999),
                  eps=1e-8,
                  weight_decay=0,
                  amsgrad=False,
@@ -38,11 +37,6 @@ class DeepSpeedCPUAdam(torch.optim.Optimizer):
         with minimal impact on training throughput. DeepSpeedCPUAdam plays an important role to minimize
         the overhead of the optimizer's latency on CPU. Please refer to ZeRO-Offload tutorial
         (https://www.deepspeed.ai/tutorials/zero-offload/) for more information on how to enable this technology.
-
-        For calling step function, there are two options available: (1) update optimizer's states and (2) update
-        optimizer's states and copy the parameters back to GPU at the same time. We have seen that the second
-        option can bring 30% higher throughput than the doing the copy separately using option one.
-
 
         .. note::
                 We recommend using our `config
@@ -64,8 +58,10 @@ class DeepSpeedCPUAdam(torch.optim.Optimizer):
                 algorithm from the paper `On the Convergence of Adam and Beyond`_
                 (default: False) NOT SUPPORTED in DeepSpeed CPUAdam!
             adamw_mode: select between Adam and AdamW implementations (default: AdamW)
-            full_precision_optimizer_states: creates momementum and variance in full precision regardless of
-                        the precision of the parameters (default: True)
+            fp32_optimizer_states: creates momentum and variance in full precision regardless of
+                        the precision of the parameters. Set to False to keep optimizer states
+                        in the parameter dtype (e.g. bf16), which reduces the optimizer-state
+                        memory footprint at the cost of lower state precision. (default: True)
         """
 
         default_args = dict(lr=lr,
@@ -74,27 +70,43 @@ class DeepSpeedCPUAdam(torch.optim.Optimizer):
                             weight_decay=weight_decay,
                             bias_correction=bias_correction,
                             amsgrad=amsgrad)
-        super(DeepSpeedCPUAdam, self).__init__(model_params, default_args)
+        super(DeepSpeedCPUAdam, self).__init__(model_params, default_args, fp32_optimizer_states)
+
+        # Imported here because importing cpuinfo runs subprocesses (file, uname), which slows down import deepspeed.
+        from cpuinfo import get_cpu_info
+        cpu_info = get_cpu_info()
+        self.cpu_vendor = cpu_info["vendor_id_raw"].lower() if "vendor_id_raw" in cpu_info else "unknown"
+        if "amd" in self.cpu_vendor:
+            for group_id, group in enumerate(self.param_groups):
+                for param_id, p in enumerate(group['params']):
+                    if p.dtype == torch.half:
+                        logger.warning("FP16 params for CPUAdam may not work on AMD CPUs")
+                        break
+                else:
+                    continue
+                break
 
         self.opt_id = DeepSpeedCPUAdam.optimizer_id
         DeepSpeedCPUAdam.optimizer_id = DeepSpeedCPUAdam.optimizer_id + 1
         self.adam_w_mode = adamw_mode
-        self.fp32_optimizer_states = fp32_optimizer_states
-        self.ds_opt_adam = CPUAdamBuilder().load()
+        try:
+            self.ds_opt_adam = CPUAdamBuilder().load()
+        except Exception as e:
+            raise RuntimeError("DeepSpeedCPUAdam requires the cpu_adam op, which failed to build/load.") from e
 
-        self.ds_opt_adam.create_adam(self.opt_id,
-                                     lr,
-                                     betas[0],
-                                     betas[1],
-                                     eps,
-                                     weight_decay,
-                                     adamw_mode,
+        self.ds_opt_adam.create_adam(self.opt_id, lr, betas[0], betas[1], eps, weight_decay, adamw_mode,
                                      should_log_le("info"))
 
     def __del__(self):
         # need to destroy the C++ object explicitly to avoid a memory leak when deepspeed.initialize
         # is used multiple times in the same process (notebook or pytest worker)
-        self.ds_opt_adam.destroy_adam(self.opt_id)
+        if hasattr(self, 'ds_opt_adam'):
+            self.ds_opt_adam.destroy_adam(self.opt_id)
+
+    def add_param_group(self, param_group):
+        if param_group.get('amsgrad', self.defaults['amsgrad']):
+            raise RuntimeError('DeepSpeedCPUAdam does not support the AMSGrad variant.')
+        super().add_param_group(param_group)
 
     def __setstate__(self, state):
         super(DeepSpeedCPUAdam, self).__setstate__(state)
@@ -102,7 +114,7 @@ class DeepSpeedCPUAdam(torch.optim.Optimizer):
             group.setdefault('amsgrad', False)
 
     @torch.no_grad()
-    def step(self, closure=None, fp16_param_groups=None):
+    def step(self, closure=None):
         """Update the model parameters.
 
         .. note::
@@ -114,8 +126,6 @@ class DeepSpeedCPUAdam(torch.optim.Optimizer):
         Args:
             closure (callable, optional): closure to compute the loss.
                 Defaults to ``None``.
-            fp16_param_groups: FP16 GPU parameters to update. Performing the
-                copy here reduces communication time. Defaults to ``None``.
 
         Returns:
             loss: if ``closure`` is provided. Otherwise ``None``.
@@ -126,61 +136,116 @@ class DeepSpeedCPUAdam(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        # intended device for step
+        device = torch.device('cpu')
+
         for group_id, group in enumerate(self.param_groups):
             for param_id, p in enumerate(group['params']):
 
                 if p.grad is None:
                     continue
 
+                assert p.device == device, f"CPUAdam param is on {p.device} and must be 'cpu', make " \
+                        "sure you enabled 'offload_optimizer': 'cpu' in your ZeRO config."
+
                 state = self.state[p]
                 # State initialization
                 if len(state) == 0:
-                    #print(f'group {group_id} param {param_id} = {p.numel()}')
                     state['step'] = 0
 
                     #use full precision by default unless self.fp32_optimizer_states is off
                     state_dtype = torch.float if self.fp32_optimizer_states else p.dtype
 
                     # gradient momentums
-                    state['exp_avg'] = torch.zeros_like(p.data,
-                                                        dtype=state_dtype,
-                                                        device='cpu')
-                    #memory_format=torch.preserve_format)
+                    state['exp_avg'] = torch.zeros_like(p.data, dtype=state_dtype, device=device)
                     # gradient variances
-                    state['exp_avg_sq'] = torch.zeros_like(p.data,
-                                                           dtype=state_dtype,
-                                                           device='cpu')
-                    #memory_format=torch.preserve_format)
+                    state['exp_avg_sq'] = torch.zeros_like(p.data, dtype=state_dtype, device=device)
 
                 state['step'] += 1
                 beta1, beta2 = group['betas']
 
-                if fp16_param_groups is not None:
-                    self.ds_opt_adam.adam_update_copy(
-                        self.opt_id,
-                        state['step'],
-                        group['lr'],
-                        beta1,
-                        beta2,
-                        group['eps'],
-                        group['weight_decay'],
-                        group['bias_correction'],
-                        p.data,
-                        p.grad.data,
-                        state['exp_avg'],
-                        state['exp_avg_sq'],
-                        fp16_param_groups[group_id][param_id].data)
-                else:
-                    self.ds_opt_adam.adam_update(self.opt_id,
-                                                 state['step'],
-                                                 group['lr'],
-                                                 beta1,
-                                                 beta2,
-                                                 group['eps'],
-                                                 group['weight_decay'],
-                                                 group['bias_correction'],
-                                                 p.data,
-                                                 p.grad.data,
-                                                 state['exp_avg'],
-                                                 state['exp_avg_sq'])
+                self.ds_opt_adam.adam_update(self.opt_id, state['step'], group['lr'], beta1, beta2, group['eps'],
+                                             group['weight_decay'], group['bias_correction'], p.data, p.grad.data,
+                                             state['exp_avg'], state['exp_avg_sq'])
+        return loss
+
+    @torch.no_grad()
+    def step_subgroup(self, subgroup_id: int, closure=None):
+        """Update the model parameters in a single subgroup (by index)."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        # Intended device for step
+        device = torch.device('cpu')
+
+        for group in self.param_groups:
+            for p in group['params']:
+
+                if p.grad is None:
+                    continue
+
+                assert p.device == device, f"CPUAdam param is on {p.device} and must be 'cpu', make " \
+                        "sure you enabled 'offload_optimizer': 'cpu' in your ZeRO config."
+
+                state = self.state[subgroup_id]
+
+                if len(state) == 0:
+                    state['step'] = 0
+
+                    state_dtype = torch.float if self.fp32_optimizer_states else p.dtype
+
+                    state['exp_avg'] = torch.zeros_like(p.data, dtype=state_dtype, device=device)
+                    state['exp_avg_sq'] = torch.zeros_like(p.data, dtype=state_dtype, device=device)
+
+                state['step'] += 1
+                beta1, beta2 = group['betas']
+                self.ds_opt_adam.adam_update(self.opt_id, state['step'], group['lr'], beta1, beta2, group['eps'],
+                                             group['weight_decay'], group['bias_correction'], p.data, p.grad.data,
+                                             state['exp_avg'], state['exp_avg_sq'])
+        return loss
+
+    @torch.no_grad()
+    def rollback_subgroup(self, sub_group_id: int, closure=None):
+        """
+        Rollback the optimizer state for a specific subgroup.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        # Intended device for step
+        device = torch.device('cpu')
+
+        # Validate subgroup state exists and is initialized
+        if sub_group_id not in self.state or len(self.state[sub_group_id]) == 0:
+            raise RuntimeError(f"Cannot rollback optimizer state for sub_group_id {sub_group_id} "
+                               f"as it has not been initialized.")
+
+        subgroup_state = self.state[sub_group_id]
+
+        # Check if we can rollback (step count must be > 0)
+        if subgroup_state.get('step', 0) <= 0:
+            raise RuntimeError(f"Cannot rollback sub_group_id {sub_group_id}: "
+                               f"step count is {subgroup_state.get('step', 0)}")
+
+        for _, group in enumerate(self.param_groups):
+            for _, param in enumerate(group['params']):
+                if param.grad is None:
+                    continue
+
+                assert param.device == device, (
+                    f"CPUAdam param is on {param.device} and must be 'cpu', "
+                    f"make sure you enabled 'offload_optimizer': 'cpu' in your ZeRO config.")
+
+                beta1, beta2 = group['betas']
+
+                self.ds_opt_adam.adam_rollback(self.opt_id, subgroup_state['step'], group['lr'], beta1, beta2,
+                                               group['eps'], group['weight_decay'], group['bias_correction'],
+                                               param.data, param.grad.data, subgroup_state['exp_avg'],
+                                               subgroup_state['exp_avg_sq'])
+
+                subgroup_state['step'] -= 1
         return loss

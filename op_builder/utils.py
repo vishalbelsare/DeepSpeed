@@ -1,6 +1,8 @@
-"""
-Copyright 2020 The Microsoft DeepSpeed Team
-"""
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# DeepSpeed Team
+
 from .builder import OpBuilder
 
 
@@ -15,4 +17,4 @@ class UtilsBuilder(OpBuilder):
         return f'deepspeed.ops.{self.NAME}_op'
 
     def sources(self):
-        return ['csrc/utils/flatten_unflatten.cpp']
+        return ['csrc/utils/tensor_cast.cpp', 'csrc/utils/py_ds_utils.cpp']

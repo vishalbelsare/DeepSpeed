@@ -19,7 +19,7 @@ Training API
    training
 
 Inference API
-------------
+-------------
 
 .. toctree::
    :maxdepth: 2
@@ -32,6 +32,7 @@ Checkpointing API
    :maxdepth: 2
 
    model-checkpointing
+   affine-transfer
    activation-checkpointing
 
 
@@ -42,11 +43,12 @@ ZeRO API
 
    zero3
 
-Mixture of Experts (MoE)
-------------------------
+Mixture of Experts
+------------------
 .. toctree::
    :maxdepth: 2
 
+   autoep
    moe
 
 Transformer Kernel API
@@ -64,14 +66,14 @@ Pipeline Parallelism
    pipeline
 
 Optimizers
---------------------
+----------
 .. toctree::
    :maxdepth: 2
 
    optimizers
 
 Learning Rate Schedulers
---------------------
+------------------------
 .. toctree::
    :maxdepth: 2
 
@@ -97,6 +99,13 @@ Memory Usage
    :maxdepth: 2
 
    memory
+
+Monitoring
+----------
+.. toctree::
+   :maxdepth: 2
+
+   monitor
 
 Indices and tables
 ------------------

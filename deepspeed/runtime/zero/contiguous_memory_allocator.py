@@ -1,12 +1,20 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# DeepSpeed Team
+
 import torch
+
+from deepspeed import comm as dist
 
 
 def print_rank_0(message):
-    if torch.distributed.get_rank() == 0:
+    if dist.get_rank() == 0:
         print(message)
 
 
 class ContiguousMemoryAllocator(object):
+
     def __init__(self, size, dtype, device):
         self.buffer = torch.zeros(size, dtype=dtype, device=device)
 
@@ -70,14 +78,14 @@ class ContiguousMemoryAllocator(object):
         return ret_tensor
 
     #assigns the tensor data to the param data and keeps track of the assignment
-    #any change the the underlying buffer from defragmentation will cause a
+    #any change the underlying buffer from defragmentation will cause a
     #reassignment of the param data
     def assign_to_param(self, tensor, param, numel, shape):
         tensor_id = id(tensor)
 
         assert tensor_id in self.tensor_map.keys(), "No such tensor allocated by the allocator."
         assert tensor.numel() >= numel, "Assert tensor buffer does is not large enough"
-        assert not tensor_id in self.id_to_params.keys(), "This tensor has already been assigned to a param"
+        assert tensor_id not in self.id_to_params.keys(), "This tensor has already been assigned to a param"
 
         self.id_to_params[tensor_id] = [param]
 
@@ -94,9 +102,8 @@ class ContiguousMemoryAllocator(object):
         self._unassign_params(tensor_id)
         self.total_free += tensor_size
         print_rank_0(
-            f"Free before release {free_before}. Released {tensor.numel()}. Total free after {self.total_free}."
-        )
-        assert self.total_free - tensor_size == free_before, "Release bookeeping error"
+            f"Free before release {free_before}. Released {tensor.numel()}. Total free after {self.total_free}.")
+        assert self.total_free - tensor_size == free_before, "Release bookkeeping error"
 
     def release_tensor_with_id(self, tensor_id):
         free_before = self.total_free
@@ -107,9 +114,8 @@ class ContiguousMemoryAllocator(object):
         self._unassign_params(tensor_id)
         self.total_free += tensor_size
         print_rank_0(
-            f"Free before release {free_before}. Released {tensor.numel()}. Total free after {self.total_free}."
-        )
-        assert self.total_free - tensor_size == free_before, "Release bookeeping error"
+            f"Free before release {free_before}. Released {tensor.numel()}. Total free after {self.total_free}.")
+        assert self.total_free - tensor_size == free_before, "Release bookkeeping error"
 
     #shows the current memory allocation at specified resolution
     def print_allocation(self, resolution=200):
@@ -132,9 +138,7 @@ class ContiguousMemoryAllocator(object):
     def _reset_param_data(self):
         for id, tensor in self.tensor_map.items():
             for param in self.id_to_params[id]:
-                param.data = tensor.narrow(0,
-                                           0,
-                                           param.numel()).view(param.data.shape).data
+                param.data = tensor.narrow(0, 0, param.numel()).view(param.data.shape).data
 
     def _unassign_params(self, tensor_id):
         if tensor_id in self.id_to_params.keys():
@@ -189,7 +193,7 @@ class ContiguousMemoryAllocator(object):
             tensor = self.tensor_map[self.tensor_ids[tensor_addr]]
 
             assert tensor_size == tensor.numel(), \
-                "Size mismatch. {tensor_size} is allocated at addr {tensor_addr} but tensor size is {tensor.numel()} "
+                f"Size mismatch. {tensor_size} is allocated at addr {tensor_addr} but tensor size is {tensor.numel()} "
 
             assert empty_addr != tensor_addr, \
                 f"Cannot have same empty address {empty_addr} and tensor address {tensor_addr}"
@@ -202,7 +206,6 @@ class ContiguousMemoryAllocator(object):
                     dest_buffer.data.copy_(src_buffer.data)
                 else:
 
-                    #print_rank_0(f'empty addr : {empty_addr}, empty size {empty_size} tensor addr {tensor_addr} tensor size {tensor_size}')
                     src_addr = tensor_addr
                     dest_addr = empty_addr
                     while src_addr < (tensor_addr + tensor_size):

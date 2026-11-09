@@ -1,37 +1,49 @@
-"""
-Copyright 2020 The Microsoft DeepSpeed Team
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
 
+# DeepSpeed Team
+"""
 DeepSpeed library
 
-To build wheel on Windows:
-    1. Install pytorch, such as pytorch 1.8 + cuda 11.1
-    2. Install visual cpp build tool
-    3. Launch cmd console with Administrator privilege for creating required symlink folders
+To build wheels on Windows:
+1. Install pytorch, such as pytorch 2.3 + cuda 12.1.
+2. Install visual cpp build tool.
+3. Include cuda toolkit.
+4. Launch cmd console with Administrator privilege for creating required symlink folders.
+
 
 Create a new wheel via the following command:
-    python setup.py bdist_wheel
+build_win.bat
 
 The wheel will be located at: dist/*.whl
 """
 
+import pathlib
 import os
-import sys
 import shutil
+import sys
 import subprocess
-import warnings
 from setuptools import setup, find_packages
+from setuptools.command import egg_info
 import time
+import typing
+import shlex
 
 torch_available = True
 try:
     import torch
-    from torch.utils.cpp_extension import BuildExtension
 except ImportError:
     torch_available = False
     print('[WARNING] Unable to import torch, pre-compiling ops will be disabled. ' \
         'Please visit https://pytorch.org/ to see how to properly install torch on your system.')
 
-from op_builder import ALL_OPS, get_default_compute_capabilities
+from op_builder import get_default_compute_capabilities, OpBuilder
+from op_builder.all_ops import ALL_OPS, accelerator_name
+
+from accelerator import get_accelerator
+
+# Fetch rocm state.
+is_rocm_pytorch = OpBuilder.is_rocm_pytorch()
 
 RED_START = '\033[31m'
 RED_END = '\033[0m'
@@ -48,23 +60,40 @@ def fetch_requirements(path):
         return [r.strip() for r in fd.readlines()]
 
 
+def is_env_set(key):
+    """
+    Checks if an environment variable is set and not "".
+    """
+    return bool(os.environ.get(key, None))
+
+
+def get_env_if_set(key, default: typing.Any = ""):
+    """
+    Returns an environment variable if it is set and not "",
+    otherwise returns a default value. In contrast, the fallback
+    parameter of os.environ.get() is skipped if the variable is set to "".
+    """
+    return os.environ.get(key, None) or default
+
+
 install_requires = fetch_requirements('requirements/requirements.txt')
 extras_require = {
-    '1bit_mpi' : fetch_requirements('requirements/requirements-1bit-mpi.txt'),
-    '1bit': [], # Will add proper cupy version below
     'readthedocs': fetch_requirements('requirements/requirements-readthedocs.txt'),
     'dev': fetch_requirements('requirements/requirements-dev.txt'),
     'autotuning': fetch_requirements('requirements/requirements-autotuning.txt'),
     'autotuning_ml': fetch_requirements('requirements/requirements-autotuning-ml.txt'),
+    'inf': fetch_requirements('requirements/requirements-inf.txt'),
+    'sd': fetch_requirements('requirements/requirements-sd.txt'),
+    'triton': [],  # Retained for backward compatibility; PyTorch owns Triton.
+    'deepcompile': fetch_requirements('requirements/requirements-deepcompile.txt'),
+    'torchembed': fetch_requirements('requirements/requirements-torchembed.txt'),
 }
 
-# Add specific cupy version to both onebit extension variants
-if torch_available and torch.cuda.is_available():
-    cupy = f"cupy-cuda{torch.version.cuda.replace('.','')[:3]}"
-    extras_require['1bit_mpi'].append(cupy)
-    extras_require['1bit'].append(cupy)
+# Only install pynvml on nvidia gpus.
+if torch_available and get_accelerator().device_name() == 'cuda' and not is_rocm_pytorch:
+    install_requires.append('nvidia-ml-py')
 
-# Make an [all] extra that installs all needed dependencies
+# Make an [all] extra that installs all needed dependencies.
 all_extras = set()
 for extra in extras_require.items():
     for req in extra[1]:
@@ -73,9 +102,10 @@ extras_require['all'] = list(all_extras)
 
 cmdclass = {}
 
-# For any pre-installed ops force disable ninja
+# For any pre-installed ops force disable ninja.
 if torch_available:
-    cmdclass['build_ext'] = BuildExtension.with_options(use_ninja=False)
+    use_ninja = is_env_set("DS_ENABLE_NINJA")
+    cmdclass['build_ext'] = get_accelerator().build_extension().with_options(use_ninja=use_ninja)
 
 if torch_available:
     TORCH_MAJOR = torch.__version__.split('.')[0]
@@ -84,20 +114,19 @@ else:
     TORCH_MAJOR = "0"
     TORCH_MINOR = "0"
 
-if torch_available and not torch.cuda.is_available():
-    # Fix to allow docker builds, similar to https://github.com/NVIDIA/apex/issues/486
-    print(
-        "[WARNING] Torch did not find cuda available, if cross-compiling or running with cpu only "
-        "you can ignore this message. Adding compute capability for Pascal, Volta, and Turing "
-        "(compute capabilities 6.0, 6.1, 6.2)")
-    if os.environ.get("TORCH_CUDA_ARCH_LIST", None) is None:
+if torch_available and not get_accelerator().device_name() == 'cuda':
+    # Fix to allow docker builds, similar to https://github.com/NVIDIA/apex/issues/486.
+    print("[WARNING] Torch did not find cuda available, if cross-compiling or running with cpu only "
+          "you can ignore this message. Adding compute capability for Pascal, Volta, and Turing "
+          "(compute capabilities 6.0, 6.1, 6.2)")
+    if not is_env_set("TORCH_CUDA_ARCH_LIST"):
         os.environ["TORCH_CUDA_ARCH_LIST"] = get_default_compute_capabilities()
 
 ext_modules = []
 
 # Default to pre-install kernels to false so we rely on JIT on Linux, opposite on Windows.
 BUILD_OP_PLATFORM = 1 if sys.platform == "win32" else 0
-BUILD_OP_DEFAULT = int(os.environ.get('DS_BUILD_OPS', BUILD_OP_PLATFORM))
+BUILD_OP_DEFAULT = int(get_env_if_set('DS_BUILD_OPS', BUILD_OP_PLATFORM))
 print(f"DS_BUILD_OPS={BUILD_OP_DEFAULT}")
 
 if BUILD_OP_DEFAULT:
@@ -106,10 +135,12 @@ if BUILD_OP_DEFAULT:
 
 def command_exists(cmd):
     if sys.platform == "win32":
-        result = subprocess.Popen(f'{cmd}', stdout=subprocess.PIPE, shell=True)
+        safe_cmd = shlex.split(f'{cmd}')
+        result = subprocess.Popen(safe_cmd, stdout=subprocess.PIPE)
         return result.wait() == 1
     else:
-        result = subprocess.Popen(f'type {cmd}', stdout=subprocess.PIPE, shell=True)
+        safe_cmd = shlex.split(f"bash -c type {cmd}")
+        result = subprocess.Popen(safe_cmd, stdout=subprocess.PIPE)
         return result.wait() == 0
 
 
@@ -121,43 +152,59 @@ def op_envvar(op_name):
 
 def op_enabled(op_name):
     env_var = op_envvar(op_name)
-    return int(os.environ.get(env_var, BUILD_OP_DEFAULT))
+    return int(get_env_if_set(env_var, BUILD_OP_DEFAULT))
 
 
-compatible_ops = dict.fromkeys(ALL_OPS.keys(), False)
 install_ops = dict.fromkeys(ALL_OPS.keys(), False)
 for op_name, builder in ALL_OPS.items():
     op_compatible = builder.is_compatible()
-    compatible_ops[op_name] = op_compatible
 
-    # If op is requested but not available, throw an error
+    # If op is requested but not available, throw an error.
     if op_enabled(op_name) and not op_compatible:
         env_var = op_envvar(op_name)
-        if env_var not in os.environ:
-            builder.warning(f"One can disable {op_name} with {env_var}=0")
-        abort(f"Unable to pre-compile {op_name}")
+        if not is_env_set(env_var):
+            builder.warning(f"Skip pre-compile of incompatible {op_name}; One can disable {op_name} with {env_var}=0")
+        continue
 
-    # If op is compatible update install reqs so it can potentially build/run later
-    if op_compatible:
-        reqs = builder.python_requirements()
-        install_requires += builder.python_requirements()
+    # If op is compatible but install is not enabled (JIT mode).
+    if is_rocm_pytorch and op_compatible and not op_enabled(op_name):
+        builder.hipify_extension()
 
-    # If op install enabled, add builder to extensions
+    # If op install enabled, add builder to extensions.
     if op_enabled(op_name) and op_compatible:
         assert torch_available, f"Unable to pre-compile {op_name}, please first install torch"
         install_ops[op_name] = op_enabled(op_name)
         ext_modules.append(builder.builder())
 
+# async_io/gds load the pin_memory op's shared manager at runtime. If they are
+# precompiled but pin_memory is not, deployments without a compiler would hit a
+# runtime JIT build, so precompile pin_memory alongside them.
+pin_memory_dependents = [name for name in ("async_io", "gds") if install_ops.get(name)]
+if pin_memory_dependents and not install_ops.get("pin_memory"):
+    pin_memory_builder = ALL_OPS.get("pin_memory")
+    if pin_memory_builder is not None and pin_memory_builder.is_compatible():
+        assert torch_available, "Unable to pre-compile pin_memory, please first install torch"
+        install_ops["pin_memory"] = 1
+        ext_modules.append(pin_memory_builder.builder())
+    else:
+        raise RuntimeError(
+            f"Cannot pre-compile {', '.join(pin_memory_dependents)} without pin_memory, which is required at "
+            "runtime but is not compatible on this platform.")
+
 print(f'Install Ops={install_ops}')
 
-# Write out version/git info
-git_hash_cmd = "git rev-parse --short HEAD"
-git_branch_cmd = "git rev-parse --abbrev-ref HEAD"
-if command_exists('git') and 'DS_BUILD_STRING' not in os.environ:
+# Write out version/git info.
+if sys.platform == "win32":
+    git_hash_cmd = shlex.split("git rev-parse --short HEAD")
+    git_branch_cmd = shlex.split("git rev-parse --abbrev-ref HEAD")
+else:
+    git_hash_cmd = shlex.split("bash -c \"git rev-parse --short HEAD\"")
+    git_branch_cmd = shlex.split("bash -c \"git rev-parse --abbrev-ref HEAD\"")
+if command_exists('git') and not is_env_set('DS_BUILD_STRING'):
     try:
-        result = subprocess.check_output(git_hash_cmd, shell=True)
+        result = subprocess.check_output(git_hash_cmd)
         git_hash = result.decode('utf-8').strip()
-        result = subprocess.check_output(git_branch_cmd, shell=True)
+        result = subprocess.check_output(git_branch_cmd)
         git_branch = result.decode('utf-8').strip()
     except subprocess.CalledProcessError:
         git_hash = "unknown"
@@ -166,47 +213,64 @@ else:
     git_hash = "unknown"
     git_branch = "unknown"
 
-
-def create_dir_symlink(src, dest):
-    if not os.path.islink(dest):
-        if os.path.exists(dest):
-            os.remove(dest)
-        assert not os.path.exists(dest)
-        os.symlink(src, dest)
-
-
 if sys.platform == "win32":
-    # This creates a symbolic links on Windows.
-    # It needs Administrator privilege to create symlinks on Windows.
-    create_dir_symlink('..\\..\\csrc', '.\\deepspeed\\ops\\csrc')
-    create_dir_symlink('..\\..\\op_builder', '.\\deepspeed\\ops\\op_builder')
+    shutil.rmtree('.\\deepspeed\\ops\\csrc', ignore_errors=True)
+    pathlib.Path('.\\deepspeed\\ops\\csrc').unlink(missing_ok=True)
+    shutil.copytree('.\\csrc', '.\\deepspeed\\ops\\csrc', dirs_exist_ok=True)
+    shutil.rmtree('.\\deepspeed\\ops\\op_builder', ignore_errors=True)
+    pathlib.Path('.\\deepspeed\\ops\\op_builder').unlink(missing_ok=True)
+    shutil.copytree('.\\op_builder', '.\\deepspeed\\ops\\op_builder', dirs_exist_ok=True)
+    shutil.rmtree('.\\deepspeed\\accelerator', ignore_errors=True)
+    pathlib.Path('.\\deepspeed\\accelerator').unlink(missing_ok=True)
+    shutil.copytree('.\\accelerator', '.\\deepspeed\\accelerator', dirs_exist_ok=True)
+    egg_info.manifest_maker.template = 'MANIFEST_win.in'
 
-# Parse the DeepSpeed version string from version.txt
+# Parse the DeepSpeed version string from version.txt.
 version_str = open('version.txt', 'r').read().strip()
 
 # Build specifiers like .devX can be added at install time. Otherwise, add the git hash.
-# example: DS_BUILD_STR=".dev20201022" python setup.py sdist bdist_wheel
+# Example: `DS_BUILD_STRING=".dev20201022" python -m build --no-isolation`.
 
-# Building wheel for distribution, update version file
-if 'DS_BUILD_STRING' in os.environ:
-    # Build string env specified, probably building for distribution
+# Building wheel for distribution, update version file.
+if is_env_set('DS_BUILD_STRING'):
+    # Build string env specified, probably building for distribution.
     with open('build.txt', 'w') as fd:
-        fd.write(os.environ.get('DS_BUILD_STRING'))
-    version_str += os.environ.get('DS_BUILD_STRING')
+        fd.write(os.environ['DS_BUILD_STRING'])
+    version_str += os.environ['DS_BUILD_STRING']
 elif os.path.isfile('build.txt'):
-    # build.txt exists, probably installing from distribution
+    # build.txt exists, probably installing from distribution.
     with open('build.txt', 'r') as fd:
         version_str += fd.read().strip()
 else:
-    # None of the above, probably installing from source
+    # None of the above, probably installing from source.
     version_str += f'+{git_hash}'
 
 torch_version = ".".join([TORCH_MAJOR, TORCH_MINOR])
-# Set cuda_version to 0.0 if cpu-only
+bf16_support = False
+# Set cuda_version to 0.0 if cpu-only.
 cuda_version = "0.0"
+nccl_version = "0.0"
+# Set hip_version to 0.0 if cpu-only.
+hip_version = "0.0"
 if torch_available and torch.version.cuda is not None:
     cuda_version = ".".join(torch.version.cuda.split('.')[:2])
-torch_info = {"version": torch_version, "cuda_version": cuda_version}
+    if sys.platform != "win32":
+        if isinstance(torch.cuda.nccl.version(), int):
+            # This will break if minor version > 9.
+            nccl_version = ".".join(str(torch.cuda.nccl.version())[:2])
+        else:
+            nccl_version = ".".join(map(str, torch.cuda.nccl.version()[:2]))
+    if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_available():
+        bf16_support = torch.cuda.is_bf16_supported()
+if torch_available and hasattr(torch.version, 'hip') and torch.version.hip is not None:
+    hip_version = ".".join(torch.version.hip.split('.')[:2])
+torch_info = {
+    "version": torch_version,
+    "bf16_support": bf16_support,
+    "cuda_version": cuda_version,
+    "nccl_version": nccl_version,
+    "hip_version": hip_version
+}
 
 print(f"version={version_str}, git_hash={git_hash}, git_branch={git_branch}")
 with open('deepspeed/git_version_info_installed.py', 'w') as fd:
@@ -214,17 +278,24 @@ with open('deepspeed/git_version_info_installed.py', 'w') as fd:
     fd.write(f"git_hash='{git_hash}'\n")
     fd.write(f"git_branch='{git_branch}'\n")
     fd.write(f"installed_ops={install_ops}\n")
-    fd.write(f"compatible_ops={compatible_ops}\n")
+    fd.write(f"accelerator_name='{accelerator_name}'\n")
     fd.write(f"torch_info={torch_info}\n")
 
 print(f'install_requires={install_requires}')
-print(f'compatible_ops={compatible_ops}')
 print(f'ext_modules={ext_modules}')
 
 # Parse README.md to make long_description for PyPI page.
 thisdir = os.path.abspath(os.path.dirname(__file__))
 with open(os.path.join(thisdir, 'README.md'), encoding='utf-8') as fin:
     readme_text = fin.read()
+
+if sys.platform == "win32":
+    scripts = ['bin/deepspeed.bat', 'bin/ds', 'bin/ds_report.bat', 'bin/ds_report']
+else:
+    scripts = [
+        'bin/deepspeed', 'bin/deepspeed.pt', 'bin/ds', 'bin/ds_ssh', 'bin/ds_report', 'bin/ds_bench', 'bin/dsr',
+        'bin/ds_nvme_tune', 'bin/ds_io'
+    ]
 
 start_time = time.time()
 
@@ -234,28 +305,23 @@ setup(name='deepspeed',
       long_description=readme_text,
       long_description_content_type='text/markdown',
       author='DeepSpeed Team',
-      author_email='deepspeed@microsoft.com',
+      author_email='info@deepspeedai.com',
       url='http://deepspeed.ai',
+      project_urls={
+          'Documentation': 'https://deepspeed.readthedocs.io',
+          'Source': 'https://github.com/deepspeedai/DeepSpeed',
+      },
       install_requires=install_requires,
       extras_require=extras_require,
-      packages=find_packages(exclude=["docker",
-                                      "third_party"]),
+      packages=find_packages(include=['deepspeed', 'deepspeed.*']),
       include_package_data=True,
-      scripts=[
-          'bin/deepspeed',
-          'bin/deepspeed.pt',
-          'bin/ds',
-          'bin/ds_ssh',
-          'bin/ds_report',
-          'bin/ds_elastic'
-      ],
+      scripts=scripts,
       classifiers=[
-          'Programming Language :: Python :: 3.6',
-          'Programming Language :: Python :: 3.7',
-          'Programming Language :: Python :: 3.8',
-          'Programming Language :: Python :: 3.9'
+          'Programming Language :: Python :: 3.8', 'Programming Language :: Python :: 3.9',
+          'Programming Language :: Python :: 3.10', 'Programming Language :: Python :: 3.11',
+          'Programming Language :: Python :: 3.12'
       ],
-      license='MIT',
+      license='Apache Software License 2.0',
       ext_modules=ext_modules,
       cmdclass=cmdclass)
 

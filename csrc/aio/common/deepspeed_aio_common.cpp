@@ -1,11 +1,14 @@
-/*
-Copyright 2020 The Microsoft DeepSpeed Team
-Licensed under the MIT license.
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
 
+// DeepSpeed Team
+
+/*
 Functionality for swapping optimizer tensors to/from (NVMe) storage devices.
 */
 
 #include <assert.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -66,10 +69,13 @@ static void _get_aio_latencies(std::vector<std::chrono::duration<double>>& raw_l
         std::accumulate(lat_usec.begin(), lat_usec.end(), 0) / lat_usec.size();
 }
 
-static void _do_io_submit_singles(const long long int n_iocbs,
-                                  const long long int iocb_index,
-                                  std::unique_ptr<aio_context>& aio_ctxt,
-                                  std::vector<std::chrono::duration<double>>& submit_times)
+// The submit and complete helpers keep the first failure in error_code, as a negative errno.
+
+static int64_t _do_io_submit_singles(const int64_t n_iocbs,
+                                     const int64_t iocb_index,
+                                     std::unique_ptr<aio_context>& aio_ctxt,
+                                     std::vector<std::chrono::duration<double>>& submit_times,
+                                     int& error_code)
 {
     for (auto i = 0; i < n_iocbs; ++i) {
         const auto st = std::chrono::high_resolution_clock::now();
@@ -83,14 +89,19 @@ static void _do_io_submit_singles(const long long int n_iocbs,
                aio_ctxt->_iocbs[i]->u.c.nbytes,
                aio_ctxt->_iocbs[i]->u.c.offset);
 #endif
-        assert(submit_ret > 0);
+        if (submit_ret != 1) {
+            if (error_code == 0) { error_code = (submit_ret < 0) ? submit_ret : -EIO; }
+            return i;
+        }
     }
+    return n_iocbs;
 }
 
-static void _do_io_submit_block(const long long int n_iocbs,
-                                const long long int iocb_index,
-                                std::unique_ptr<aio_context>& aio_ctxt,
-                                std::vector<std::chrono::duration<double>>& submit_times)
+static int64_t _do_io_submit_block(const int64_t n_iocbs,
+                                   const int64_t iocb_index,
+                                   std::unique_ptr<aio_context>& aio_ctxt,
+                                   std::vector<std::chrono::duration<double>>& submit_times,
+                                   int& error_code)
 {
     const auto st = std::chrono::high_resolution_clock::now();
     const auto submit_ret = io_submit(aio_ctxt->_io_ctxt, n_iocbs, aio_ctxt->_iocbs.data());
@@ -104,32 +115,54 @@ static void _do_io_submit_block(const long long int n_iocbs,
            aio_ctxt->_iocbs[0]->u.c.nbytes,
            aio_ctxt->_iocbs[0]->u.c.offset);
 #endif
-    assert(submit_ret > 0);
+    if (submit_ret == n_iocbs) { return n_iocbs; }
+    if (error_code == 0) { error_code = (submit_ret < 0) ? submit_ret : -EIO; }
+    return std::max<int64_t>(submit_ret, 0);
 }
 
-static int _do_io_complete(const long long int min_completes,
-                           const long long int max_completes,
-                           std::unique_ptr<aio_context>& aio_ctxt,
-                           std::vector<std::chrono::duration<double>>& reap_times)
+static int64_t _do_io_complete(const int64_t min_completes,
+                               const int64_t max_completes,
+                               std::unique_ptr<aio_context>& aio_ctxt,
+                               std::vector<std::chrono::duration<double>>& reap_times,
+                               int& error_code)
 {
     const auto start_time = std::chrono::high_resolution_clock::now();
-    const auto n_completes = io_getevents(
-        aio_ctxt->_io_ctxt, min_completes, max_completes, aio_ctxt->_io_events.data(), nullptr);
+    int64_t n_completes;
+    // A signal handler, e.g. for SIGCHLD of a data loader worker, can interrupt the wait on any
+    // thread.
+    do {
+        n_completes = io_pgetevents(aio_ctxt->_io_ctxt,
+                                    min_completes,
+                                    max_completes,
+                                    aio_ctxt->_io_events.data(),
+                                    nullptr,
+                                    nullptr);
+    } while (n_completes == -EINTR);
     reap_times.push_back(std::chrono::high_resolution_clock::now() - start_time);
-
     assert(n_completes >= min_completes);
+
+    // The kernel reports a failed request, e.g. an O_DIRECT buffer it cannot use, only in res: a
+    // negative errno, or fewer bytes than requested. data has the requested size from when the iocb
+    // was submitted; the iocb itself may have been prepared for another request since.
+    for (int64_t i = 0; i < n_completes; ++i) {
+        const auto& event = aio_ctxt->_io_events[i];
+        const auto num_bytes = static_cast<long>(event.res);
+        if (num_bytes != reinterpret_cast<intptr_t>(event.data) && error_code == 0) {
+            error_code = (num_bytes < 0) ? num_bytes : -EIO;
+        }
+    }
     return n_completes;
 }
 
-void do_aio_operation_sequential(const bool read_op,
-                                 std::unique_ptr<aio_context>& aio_ctxt,
-                                 std::unique_ptr<io_xfer_ctxt>& xfer_ctxt,
-                                 deepspeed_aio_config_t* config,
-                                 deepspeed_aio_perf_t* perf)
+int do_aio_operation_sequential(const bool read_op,
+                                std::unique_ptr<aio_context>& aio_ctxt,
+                                std::unique_ptr<io_xfer_ctxt>& xfer_ctxt,
+                                deepspeed_aio_config_t* config,
+                                deepspeed_aio_perf_t* perf)
 {
     struct io_prep_context prep_ctxt(read_op, xfer_ctxt, aio_ctxt->_block_size, &aio_ctxt->_iocbs);
 
-    const auto num_io_blocks = static_cast<long long int>(
+    const auto num_io_blocks = static_cast<int64_t>(
         ceil(static_cast<double>(xfer_ctxt->_num_bytes) / aio_ctxt->_block_size));
 #if DEBUG_DS_AIO_PERF
     const auto io_op_name = std::string(read_op ? "read" : "write");
@@ -140,25 +173,27 @@ void do_aio_operation_sequential(const bool read_op,
     std::vector<std::chrono::duration<double>> submit_times;
     std::vector<std::chrono::duration<double>> reap_times;
     const auto max_queue_bytes =
-        static_cast<long long int>(aio_ctxt->_queue_depth * aio_ctxt->_block_size);
+        static_cast<int64_t>(aio_ctxt->_queue_depth * aio_ctxt->_block_size);
+    int error_code = 0;
 
     auto start = std::chrono::high_resolution_clock::now();
-    for (long long iocb_index = 0; iocb_index < num_io_blocks;
+    for (int64_t iocb_index = 0; iocb_index < num_io_blocks && error_code == 0;
          iocb_index += aio_ctxt->_queue_depth) {
         const auto start_offset = iocb_index * aio_ctxt->_block_size;
         const auto start_buffer = (char*)xfer_ctxt->_mem_buffer + start_offset;
         const auto n_iocbs =
-            min(static_cast<long long>(aio_ctxt->_queue_depth), (num_io_blocks - iocb_index));
+            min(static_cast<int64_t>(aio_ctxt->_queue_depth), (num_io_blocks - iocb_index));
         const auto num_bytes = min(max_queue_bytes, (xfer_ctxt->_num_bytes - start_offset));
         prep_ctxt.prep_iocbs(n_iocbs, num_bytes, start_buffer, start_offset);
 
-        if (config->_single_submit) {
-            _do_io_submit_singles(n_iocbs, iocb_index, aio_ctxt, submit_times);
-        } else {
-            _do_io_submit_block(n_iocbs, iocb_index, aio_ctxt, submit_times);
-        }
+        const auto n_submitted =
+            config->_single_submit
+                ? _do_io_submit_singles(n_iocbs, iocb_index, aio_ctxt, submit_times, error_code)
+                : _do_io_submit_block(n_iocbs, iocb_index, aio_ctxt, submit_times, error_code);
 
-        _do_io_complete(n_iocbs, n_iocbs, aio_ctxt, reap_times);
+        if (n_submitted > 0) {
+            _do_io_complete(n_submitted, n_submitted, aio_ctxt, reap_times, error_code);
+        }
     }
     const std::chrono::duration<double> elapsed = std::chrono::high_resolution_clock::now() - start;
 
@@ -183,13 +218,14 @@ void do_aio_operation_sequential(const bool read_op,
     std::cout << c_library_name << ": finish " << io_op_name << " " << xfer_ctxt->_num_bytes
               << " bytes " << std::endl;
 #endif
+    return error_code;
 }
 
-void do_aio_operation_overlap(const bool read_op,
-                              std::unique_ptr<aio_context>& aio_ctxt,
-                              std::unique_ptr<io_xfer_ctxt>& xfer_ctxt,
-                              deepspeed_aio_config_t* config,
-                              deepspeed_aio_perf_t* perf)
+int do_aio_operation_overlap(const bool read_op,
+                             std::unique_ptr<aio_context>& aio_ctxt,
+                             std::unique_ptr<io_xfer_ctxt>& xfer_ctxt,
+                             deepspeed_aio_config_t* config,
+                             deepspeed_aio_perf_t* perf)
 {
     struct io_prep_generator io_gen(read_op, xfer_ctxt, aio_ctxt->_block_size);
 
@@ -203,28 +239,29 @@ void do_aio_operation_overlap(const bool read_op,
     std::vector<std::chrono::duration<double>> reap_times;
 
     auto request_iocbs = aio_ctxt->_queue_depth;
-    auto n_pending_iocbs = 0;
+    int64_t n_pending_iocbs = 0;
     const auto min_completes = 1;
+    int error_code = 0;
     auto start = std::chrono::high_resolution_clock::now();
     while (true) {
-        const auto n_iocbs = io_gen.prep_iocbs(request_iocbs - n_pending_iocbs, &aio_ctxt->_iocbs);
+        // After a failure, only the requests in flight are completed.
+        const auto n_iocbs = (error_code == 0) ? io_gen.prep_iocbs(request_iocbs - n_pending_iocbs,
+                                                                   &aio_ctxt->_iocbs)
+                                               : 0;
         if (n_iocbs > 0) {
-            if (config->_single_submit) {
-                _do_io_submit_singles(
-                    n_iocbs, (io_gen._next_iocb_index - n_iocbs), aio_ctxt, submit_times);
-            } else {
-                _do_io_submit_block(
-                    n_iocbs, (io_gen._next_iocb_index - n_iocbs), aio_ctxt, submit_times);
-            }
+            const auto iocb_index = io_gen._next_iocb_index - n_iocbs;
+            n_pending_iocbs +=
+                config->_single_submit
+                    ? _do_io_submit_singles(n_iocbs, iocb_index, aio_ctxt, submit_times, error_code)
+                    : _do_io_submit_block(n_iocbs, iocb_index, aio_ctxt, submit_times, error_code);
         }
 
-        n_pending_iocbs += n_iocbs;
         assert(n_pending_iocbs <= aio_ctxt->_queue_depth);
 
         if (n_pending_iocbs == 0) { break; }
 
         const auto n_complete =
-            _do_io_complete(min_completes, n_pending_iocbs, aio_ctxt, reap_times);
+            _do_io_complete(min_completes, n_pending_iocbs, aio_ctxt, reap_times, error_code);
         n_pending_iocbs -= n_complete;
     }
 
@@ -251,6 +288,7 @@ void do_aio_operation_overlap(const bool read_op,
     std::cout << c_library_name << ": finish " << io_op_name << " " << xfer_ctxt->_num_bytes
               << " bytes " << std::endl;
 #endif
+    return error_code;
 }
 
 void report_file_error(const char* filename, const std::string file_op, const int error_code)
@@ -262,7 +300,11 @@ void report_file_error(const char* filename, const std::string file_op, const in
 
 int open_file(const char* filename, const bool read_op)
 {
-    const int flags = read_op ? (O_RDONLY | __O_DIRECT) : (O_WRONLY | O_CREAT | __O_DIRECT);
+    const int flags = read_op ? (O_RDONLY | O_DIRECT) : (O_WRONLY | O_CREAT | O_DIRECT);
+#if defined(__ENABLE_CANN__)
+    int* flags_ptr = (int*)&flags;
+    *flags_ptr = read_op ? (O_RDONLY) : (O_WRONLY | O_CREAT);
+#endif
     const int mode = 0600;
     const auto fd = open(filename, flags, mode);
     if (fd == -1) {
@@ -274,15 +316,34 @@ int open_file(const char* filename, const bool read_op)
     return fd;
 }
 
+int64_t get_io_memory_alignment(const int fd)
+{
+    const auto flags = fcntl(fd, F_GETFL);
+    if (flags == -1 || !(flags & O_DIRECT)) { return 1; }
+
+    // Linux 6.1+ reports the alignment of each file: often 4 bytes on NVMe, 512 on md RAID and LVM.
+    // Older kernels need the logical block size, assumed to be 512 as elsewhere in DeepNVMe.
+    int64_t alignment = 512;
+#if defined(STATX_DIOALIGN)
+    struct statx stx;
+    if (statx(fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx) == 0 &&
+        (stx.stx_mask & STATX_DIOALIGN) && stx.stx_dio_mem_align > 0) {
+        alignment = stx.stx_dio_mem_align;
+    }
+#endif
+    return alignment;
+}
+
 int regular_read(const char* filename, std::vector<char>& buffer)
 {
-    long long int num_bytes;
-    const auto f_size = get_file_size(filename, num_bytes);
-    assert(f_size != -1);
-    buffer.resize(num_bytes);
     const auto fd = open(filename, O_RDONLY, 0600);
     assert(fd != -1);
-    long long int read_bytes = 0;
+    struct stat fs;
+    const auto result = fstat(fd, &fs);
+    assert(result != -1);
+    int64_t num_bytes = fs.st_size;
+    buffer.resize(num_bytes);
+    int64_t read_bytes = 0;
     auto r = 0;
     do {
         const auto buffer_ptr = buffer.data() + read_bytes;
@@ -292,16 +353,15 @@ int regular_read(const char* filename, std::vector<char>& buffer)
     } while (r > 0);
 
     if (read_bytes != num_bytes) {
-        std::cerr << "read error "
-                  << " read_bytes (read) = " << read_bytes << " num_bytes (fstat) = " << num_bytes
-                  << std::endl;
+        std::cerr << "read error " << " read_bytes (read) = " << read_bytes
+                  << " num_bytes (fstat) = " << num_bytes << std::endl;
     }
     assert(read_bytes == num_bytes);
     close(fd);
     return 0;
 }
 
-static bool _validate_buffer(const char* filename, void* aio_buffer, const long long int num_bytes)
+static bool _validate_buffer(const char* filename, void* aio_buffer, const int64_t num_bytes)
 {
     std::vector<char> regular_buffer;
     const auto reg_ret = regular_read(filename, regular_buffer);
@@ -309,7 +369,7 @@ static bool _validate_buffer(const char* filename, void* aio_buffer, const long 
     std::cout << "regular read of " << filename << " returned " << regular_buffer.size() << " bytes"
               << std::endl;
 
-    if (static_cast<long long int>(regular_buffer.size()) != num_bytes) { return false; }
+    if (static_cast<int64_t>(regular_buffer.size()) != num_bytes) { return false; }
 
     return (0 == memcmp(aio_buffer, regular_buffer.data(), regular_buffer.size()));
 }
@@ -317,7 +377,7 @@ static bool _validate_buffer(const char* filename, void* aio_buffer, const long 
 bool validate_aio_operation(const bool read_op,
                             const char* filename,
                             void* aio_buffer,
-                            const long long int num_bytes)
+                            const int64_t num_bytes)
 {
     const auto msg_suffix = std::string("deepspeed_aio_") +
                             std::string(read_op ? "read()" : "write()") +

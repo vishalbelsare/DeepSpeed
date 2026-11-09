@@ -1,3 +1,8 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// DeepSpeed Team
+
 #include "custom_cuda_layers.h"
 
 #define rows_trans 16
@@ -19,7 +24,7 @@ __global__ void Transpose_Kernel(const T* inp, T* out, int row_width, int col_wi
     int row_stride = rows_trans / ((rows_trans * cols_trans + THREADS - 1) / THREADS);
 
     for (int k = 0; k < rows_trans; k += row_stride)
-        data_block[(k + r) * cols_trans + c] = inp[(i + k) * row_width + j];
+        data_block[(k + r) * (cols_trans + 1) + c] = inp[(i + k) * row_width + j];
 
     __syncthreads();
 
@@ -27,7 +32,7 @@ __global__ void Transpose_Kernel(const T* inp, T* out, int row_width, int col_wi
     j = blockIdx.x / m * cols_trans + c;
 
     for (int k = 0; k < rows_trans; k += row_stride)
-        out[(i + k) * col_width + j] = data_block[c * cols_trans + r + k];
+        out[(i + k) * col_width + j] = data_block[c * (cols_trans + 1) + r + k];
 }
 
 template <>
@@ -96,7 +101,7 @@ __global__ void transform_0213<__half>(__half* output,
                                        int heads,
                                        int head_ext)
 {
-#if __CUDA_ARCH__ >= 700
+#ifdef HALF_PRECISION_AVAILABLE
 
     int d0_stride = hidden_dim * seq_length;
     int d1_stride = hidden_dim;
@@ -219,7 +224,7 @@ __global__ void bias_add_transform_0213<__half>(__half* output,
                                                 int heads,
                                                 int head_ext)
 {
-#if __CUDA_ARCH__ >= 700
+#ifdef HALF_PRECISION_AVAILABLE
 
     int d0_stride = hidden_dim * seq_length;
     int d1_stride = hidden_dim;
@@ -289,7 +294,7 @@ __global__ void bias_add_transform_0213_v2(__half* output,
                                            int seq_length,
                                            int heads)
 {
-#if __CUDA_ARCH__ >= 700
+#ifdef HALF_PRECISION_AVAILABLE
     __shared__ float4 in_data[3072];
 
     int d0_stride = hidden_dim * seq_length;
@@ -451,7 +456,7 @@ __global__ void transform4d_0213<__half>(__half* out,
                                          int hidden_dim,
                                          int head_ext)
 {
-#if __CUDA_ARCH__ >= 700
+#ifdef HALF_PRECISION_AVAILABLE
 
     int d0_stride = hidden_dim * (seq_length / head_ext);
     int d1_stride = hidden_dim;
@@ -487,7 +492,7 @@ __global__ void transform4d_0213_v2(__half* out,
                                     int seq_length,
                                     int hidden_dim)
 {
-#if __CUDA_ARCH__ >= 700
+#ifdef HALF_PRECISION_AVAILABLE
     __shared__ float4 in_data[3072];
 
     int d0_stride = hidden_dim * seq_length;

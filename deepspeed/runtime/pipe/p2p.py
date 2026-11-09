@@ -1,16 +1,16 @@
-'''
-Copyright 2019 The Microsoft DeepSpeed Team
-'''
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
 
-import pickle
+# DeepSpeed Team
+
+import msgpack
 import typing
 
 import torch
-import torch.distributed as dist
+from deepspeed import comm as dist
 
-# To query whether we have send/recv support
-from packaging.version import Version
-from deepspeed.git_version_info import torch_info
+from deepspeed.utils.torch import required_torch_version
+from deepspeed.accelerator import get_accelerator
 
 _groups = None
 _grid = None
@@ -19,13 +19,11 @@ _async = []
 
 
 def can_send_recv() -> bool:
-    torch_version = Version(torch_info['version'])
-    sendrecv_min = Version('1.8')
-    return torch_version >= sendrecv_min
+    return required_torch_version(min_version=1.8)
 
 
 #initializes adjacent process groups
-#run this only after torch.distributed.init_process_group() has been called
+#run this only after deepspeed.init_distributed() has been called
 def init_process_groups(grid):
     global _groups, _grid
     _grid = grid
@@ -47,7 +45,7 @@ def _is_valid_send_recv(src_stage, dest_stage):
 
 def send(tensor, dest_stage, async_op=False):
     global _groups
-    assert async_op == False, "Doesnt support async_op true"
+    assert async_op == False, "Doesn't support async_op true"
     src_stage = _grid.get_stage_id()
     _is_valid_send_recv(src_stage, dest_stage)
 
@@ -68,7 +66,7 @@ def send(tensor, dest_stage, async_op=False):
 
 def recv(tensor, src_stage, async_op=False):
     global _groups
-    assert async_op == False, "Doesnt support async_op true"
+    assert async_op == False, "Doesn't support async_op true"
     dest_stage = _grid.get_stage_id()
     _is_valid_send_recv(src_stage, dest_stage)
 
@@ -92,13 +90,13 @@ def wait():
         op.wait()
     _async = []
 
-    torch.cuda.synchronize()
+    get_accelerator().synchronize()
 
 
 def send_obj(msg: typing.Any, dest: int):
     """Send an arbitrary python object to ``dest``.
 
-    Note: ``msg`` must be pickleable.
+    Note: ``msg`` must be serializable by msgpack.
 
     WARN: This incurs a CPU -> GPU transfer and should be used sparingly
     for performance reasons.
@@ -108,12 +106,12 @@ def send_obj(msg: typing.Any, dest: int):
         dest (int): Destination rank.
     """
     # serialize the message
-    msg = pickle.dumps(msg)
+    msg = msgpack.packb(msg)
     # construct a tensor to send
-    msg = torch.ByteTensor(torch.ByteStorage.from_buffer(msg)).cuda()
+    msg = torch.ByteTensor(torch.ByteStorage.from_buffer(msg)).to(get_accelerator().device_name())
 
     # Send meta and message
-    length_tensor = torch.tensor([len(msg)], dtype=torch.long).cuda()
+    length_tensor = torch.tensor([len(msg)], dtype=torch.long).to(get_accelerator().device_name())
     dist.send(length_tensor, dst=dest)
     dist.send(msg, dst=dest)
 
@@ -128,19 +126,19 @@ def recv_obj(sender: int) -> typing.Any:
         sender (int): The rank sending the message.
     """
     # Get message meta
-    length = torch.tensor([0], dtype=torch.long).cuda()
+    length = torch.tensor([0], dtype=torch.long).to(get_accelerator().device_name())
     dist.recv(length, src=sender)
 
     # Receive and deserialize
-    msg = torch.empty(length.item(), dtype=torch.uint8).cuda()
+    msg = torch.empty(length.item(), dtype=torch.uint8).to(get_accelerator().device_name())
     dist.recv(msg, src=sender)
 
-    msg = pickle.loads(msg.cpu().numpy().tobytes())
+    msg = msgpack.unpackb(msg.cpu().numpy().tobytes())
 
     def _to(x):
         """Recursively move to the current device."""
         if torch.is_tensor(x):
-            return x.cuda()
+            return x.to(get_accelerator().device_name())
         if isinstance(x, (tuple, list)):
             ret = [_to(x_) for x_ in x]
             if isinstance(x, tuple):

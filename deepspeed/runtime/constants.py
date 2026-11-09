@@ -1,7 +1,9 @@
-"""
-Copyright (c) Microsoft Corporation
-Licensed under the MIT license.
-"""
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# DeepSpeed Team
+
+from deepspeed.accelerator import get_accelerator
 
 #############################################
 # Routes
@@ -16,42 +18,6 @@ ROUTE_ENCODE = "encode"
 #############################################
 TRAIN_BATCH_SIZE = "train_batch_size"
 TRAIN_BATCH_SIZE_DEFAULT = None
-
-#############################################
-# Sparse attention
-#############################################
-SPARSE_ATTENTION = "sparse_attention"
-SPARSE_DENSE_MODE = "dense"
-SPARSE_FIXED_MODE = "fixed"
-SPARSE_VARIABLE_MODE = "variable"
-SPARSE_BIGBIRD_MODE = "bigbird"
-SPARSE_BSLONGFORMER_MODE = "bslongformer"
-SPARSE_MODE = "mode"
-SPARSE_MODE_DEFAULT = SPARSE_FIXED_MODE
-SPARSE_BLOCK = "block"
-SPARSE_BLOCK_DEFAULT = 16
-SPARSE_DIFFERENT_LAYOUT_PER_HEAD = "different_layout_per_head"
-SPARSE_DIFFERENT_LAYOUT_PER_HEAD_DEFAULT = False
-SPARSE_NUM_LOCAL_BLOCKS = "num_local_blocks"
-SPARSE_NUM_LOCAL_BLOCKS_DEFAULT = 4
-SPARSE_NUM_GLOBAL_BLOCKS = "num_global_blocks"
-SPARSE_NUM_GLOBAL_BLOCKS_DEFAULT = 1
-SPARSE_ATTENTION_TYPE = "attention"
-SPARSE_ATTENTION_TYPE_DEFAULT = "bidirectional"
-SPARSE_HORIZONTAL_GLOBAL_ATTENTION = "horizontal_global_attention"
-SPARSE_HORIZONTAL_GLOBAL_ATTENTION_DEFAULT = False
-SPARSE_NUM_DIFFERENT_GLOBAL_PATTERNS = "num_different_global_patterns"
-SPARSE_NUM_DIFFERENT_GLOBAL_PATTERNS_DEFAULT = 1
-SPARSE_NUM_RANDOM_BLOCKS = "num_random_blocks"
-SPARSE_NUM_RANDOM_BLOCKS_DEFAULT = 0
-SPARSE_LOCAL_WINDOW_BLOCKS = "local_window_blocks"
-SPARSE_LOCAL_WINDOW_BLOCKS_DEFAULT = [4]
-SPARSE_GLOBAL_BLOCK_INDICES = "global_block_indices"
-SPARSE_GLOBAL_BLOCK_INDICES_DEFAULT = [0]
-SPARSE_GLOBAL_BLOCK_END_INDICES = "global_block_end_indices"
-SPARSE_GLOBAL_BLOCK_END_INDICES_DEFAULT = None
-SPARSE_NUM_SLIDING_WINDOW_BLOCKS = "num_sliding_window_blocks"
-SPARSE_NUM_SLIDING_WINDOW_BLOCKS_DEFAULT = 3
 
 #############################################
 # Optimizer and lr scheduler
@@ -72,10 +38,12 @@ MAX_GRAD_NORM = 'max_grad_norm'
 #############################################
 ZERO_ALLOW_UNTESTED_OPTIMIZER = "zero_allow_untested_optimizer"
 ZERO_ALLOW_UNTESTED_OPTIMIZER_DEFAULT = False
+ZERO_FORCE_DS_CPU_OPTIMIZER = "zero_force_ds_cpu_optimizer"
+ZERO_FORCE_DS_CPU_OPTIMIZER_DEFAULT = True
 
 # Steps
 STEPS_PER_PRINT = "steps_per_print"
-STEPS_PER_PRINT_DEFAULT = 10
+STEPS_PER_PRINT_DEFAULT = None
 
 #########################################
 # Training micro batch size per GPU
@@ -103,9 +71,12 @@ Gradient Accumulation should be of the format:
 GRADIENT_ACCUMULATION_STEPS = "gradient_accumulation_steps"
 GRADIENT_ACCUMULATION_STEPS_DEFAULT = None
 
-# DeepSpeed CSR gradient sparsity
-SPARSE_GRADIENTS = "sparse_gradients"
-SPARSE_GRADIENTS_DEFAULT = False
+#########################################
+# Managed Gradient Accumulation
+#########################################
+# True (default): DeepSpeed tracks micro-steps and steps on the boundary. False: the client owns the boundary and each step() applies an optimizer update.
+MANAGED_GRADIENT_ACCUMULATION = "managed_gradient_accumulation"
+MANAGED_GRADIENT_ACCUMULATION_DEFAULT = True
 
 #########################################
 # BFLOAT16 support
@@ -114,14 +85,35 @@ SPARSE_GRADIENTS_DEFAULT = False
 # Users can configure in ds_config.json as below example:
 BFLOAT16_FORMAT = '''
 BFLOAT16 parameters should be of the format:
-"bfloat16": {
-  "enabled": true
+"bf16": {
+  "enabled": true,
+  "immediate_grad_update": false,
+  "check_overflow": false
 }
 '''
-BFLOAT16 = "bfloat16"
+BFLOAT16 = "bf16"
+BFLOAT16_OLD = "bfloat16"  # keeping for backwards compatibility
 
 BFLOAT16_ENABLED = "enabled"
 BFLOAT16_ENABLED_DEFAULT = False
+
+CHECK_OVERFLOW = "check_overflow"
+BFLOAT16_CHECK_OVERFLOW_DEFAULT = False
+
+# BFLOAT16 optimizer immediate gradient update
+BFLOAT16_IMMEDIATE_GRAD_UPDATE = "immediate_grad_update"
+BFLOAT16_IMMEDIATE_GRAD_UPDATE_DEFAULT = True
+
+# BFLOAT16 master weights and optimizer states options
+BFLOAT16_MASTER_WEIGHTS_AND_GRADS = "bf16_master_weights_and_grads"
+BFLOAT16_MASTER_WEIGHTS_AND_GRADS_DEFAULT = False
+BFLOAT16_OPTIMIZER_STATES = "bf16_optimizer_states"
+BFLOAT16_OPTIMIZER_STATES_DEFAULT = False
+
+# DDP variant of BFLOAT16
+# DDP variant: bf16 model with bf16 grad accumulation (uses FP16_Optimizer in bf16 mode)
+# Must be different from BFLOAT16 to allow proper optimizer selection
+DDP_BFLOAT16 = "ddp_bf16"
 
 #########################################
 # FP16 support
@@ -132,10 +124,12 @@ FP16_FORMAT = '''
 FP16 parameters should be of the format:
 "fp16": {
   "enabled": true,
+  "auto_cast": false,
   "loss_scale": 0,
-  "initial_scale_power": 32,
+  "initial_scale_power": 16,
   "loss_scale_window": 1000,
   "hysteresis": 2,
+  "consecutive_hysteresis": false,
   "min_loss_scale": 1
 }
 '''
@@ -148,9 +142,12 @@ FP16_ENABLED_DEFAULT = False
 FP16_LOSS_SCALE = "loss_scale"
 FP16_LOSS_SCALE_DEFAULT = 0
 
+FP16_AUTO_CAST = "auto_cast"
+FP16_AUTO_CAST_DEFAULT = False
+
 # FP16 initial dynamic scale loss power
 FP16_INITIAL_SCALE_POWER = "initial_scale_power"
-FP16_INITIAL_SCALE_POWER_DEFAULT = 32
+FP16_INITIAL_SCALE_POWER_DEFAULT = 16
 
 # FP16 loss scale window
 FP16_LOSS_SCALE_WINDOW = "loss_scale_window"
@@ -159,6 +156,10 @@ FP16_LOSS_SCALE_WINDOW_DEFAULT = 1000
 # FP16 hysteresis
 FP16_HYSTERESIS = "hysteresis"
 FP16_HYSTERESIS_DEFAULT = 2
+
+# FP16 consecutive hysteresis
+FP16_CONSECUTIVE_HYSTERESIS = "consecutive_hysteresis"
+FP16_CONSECUTIVE_HYSTERESIS_DEFAULT = False
 
 # FP16 min loss scale
 FP16_MIN_LOSS_SCALE = "min_loss_scale"
@@ -169,34 +170,37 @@ FP16_MASTER_WEIGHTS_AND_GRADS = "fp16_master_weights_and_grads"
 FP16_MASTER_WEIGHTS_AND_GRADS_DEFAULT = False
 
 #########################################
-# Apex AMP support
+# Torch AMP support
 #########################################
-# Use Apex AMP for mixed precision support, all parameters (other than 'enabled') will be passed to
-# amp.initialize(model, optimizer, **amp_params)
-# See apex documentation for supported parameters/features: https://nvidia.github.io/apex/amp.html#apex.amp.initialize
-AMP_FORMAT = '''
-"amp" {
-  "enabled: true,
-  "opt_level": "O1",
-  ...
+TORCH_AUTOCAST_FORMAT = '''
+PyTorch autocast config should be of the format:
+"torch_autocast": {
+  "enabled": true,
+  "dtype": "bfloat16",
+  "lower_precision_safe_modules": [
+    "torch.nn.modules.linear.Linear",
+    "torch.nn.modules.conv.Conv2d"
+  ]
 }
 '''
-AMP = "amp"
+TORCH_AUTOCAST = "torch_autocast"
 
-AMP_ENABLED = "enabled"
-AMP_ENABLED_DEFAULT = False
+TORCH_AUTOCAST_ENABLED = "enabled"
+TORCH_AUTOCAST_ENABLED_DEFAULT = False
+TORCH_AUTOCAST_DTYPE = "dtype"
+TORCH_AUTOCAST_LOWER_PRECISION_SAFE_MODULES = "lower_precision_safe_modules"
 
 #########################################
 # Gradient clipping
 #########################################
-# Gradient clipping. By default, this feature is not enabled.
-# Users can configure in ds_config.json as below example:
+# Gradient clipping. By default, this feature is enabled with a value of 1.0.
+# Users can configure in ds_config.json as below example (set to 0.0 to disable):
 GRADIENT_CLIPPING_FORMAT = '''
 Gradient clipping should be enabled as:
 "gradient_clipping": 1.0
 '''
 GRADIENT_CLIPPING = 'gradient_clipping'
-GRADIENT_CLIPPING_DEFAULT = 0.
+GRADIENT_CLIPPING_DEFAULT = 1.0
 
 #########################################
 # Communication data type
@@ -210,6 +214,26 @@ Communication data type should be set as:
 '''
 COMMUNICATION_DATA_TYPE = "communication_data_type"
 COMMUNICATION_DATA_TYPE_DEFAULT = None
+
+###########################################################
+# Gradient communication data type for sequence parallelism
+###########################################################
+# Supported types: ['fp16', 'bf16','fp32']
+# Default value is fp32
+# Users can configure in ds_config.json as below example:
+SEQ_PARALLEL_COMMUNICATION_DATA_TYPE_FORMAT = '''
+Optional comm data type for seq paralleism should be set as:
+"seq_parallel_communication_data_type": "fp32"
+'''
+SEQ_PARALLEL_COMMUNICATION_DATA_TYPE = "seq_parallel_communication_data_type"
+
+if get_accelerator().device_name == 'cuda' and get_accelerator().communication_backend_version() >= (2, 27, 3):
+    # nccl>=2.27.3 uses fp32 accumulation for half precision inputs, so there is no need to waste compute and memory to manually upcast to fp32 unless the user wants it and then override
+    SEQ_PARALLEL_COMMUNICATION_DATA_TYPE_DEFAULT = None
+else:
+    SEQ_PARALLEL_COMMUNICATION_DATA_TYPE_DEFAULT = "fp32"
+
+SEQ_PARALLEL_COMMUNICATION_DATA_TYPE_DEFAULT = "fp32"
 
 #########################################
 # Scale/predivide gradients before allreduce
@@ -229,6 +253,16 @@ Gradient predivide factor should be enabled as:
 '''
 GRADIENT_PREDIVIDE_FACTOR = "gradient_predivide_factor"
 GRADIENT_PREDIVIDE_FACTOR_DEFAULT = 1.0
+
+GRADIENT_ALLREDUCE_OP_FORMAT = '''
+Gradient allreduce operation should be set as:
+"gradient_allreduce_op": "mean"
+'''
+GRADIENT_ALLREDUCE_OP = "gradient_allreduce_op"
+GRADIENT_ALLREDUCE_OP_MEAN = "mean"
+GRADIENT_ALLREDUCE_OP_SUM = "sum"
+GRADIENT_ALLREDUCE_OP_DEFAULT = GRADIENT_ALLREDUCE_OP_MEAN
+GRADIENT_ALLREDUCE_OP_SUPPORTED = (GRADIENT_ALLREDUCE_OP_MEAN, GRADIENT_ALLREDUCE_OP_SUM)
 
 #########################################
 # Disable AllGather
@@ -253,6 +287,18 @@ Dump state should be enabled as:
 '''
 DUMP_STATE = 'dump_state'
 DUMP_STATE_DEFAULT = False
+
+#########################################
+# Disable automatic Python cyclic GC
+#########################################
+# Disable automatic Python cyclic GC. By default, this feature is not enabled.
+# Users can configure in ds_config.json as below example:
+DISABLE_PYTHON_GC_FORMAT = '''
+Disable automatic Python cyclic GC should be enabled as:
+"disable_python_gc": true
+'''
+DISABLE_PYTHON_GC = "disable_python_gc"
+DISABLE_PYTHON_GC_DEFAULT = False
 
 #########################################
 # Vocabulary size
@@ -281,98 +327,6 @@ WALL_CLOCK_BREAKDOWN_DEFAULT = False
 MEMORY_BREAKDOWN = 'memory_breakdown'
 MEMORY_BREAKDOWN_DEFAULT = False
 
-#########################################
-# Tensorboard
-#########################################
-# Tensorboard. By default, this feature is not enabled.
-# Users can configure in ds_config.json as below example:
-TENSORBOARD_FORMAT = '''
-Tensorboard can be specified as:
-"tensorboard": {
-  "enabled": true,
-  "output_path": "/home/myname/foo",
-  "job_name": "model_lr2e-5_epoch3_seed2_seq64"
-}
-'''
-TENSORBOARD = "tensorboard"
-
-# Tensorboard enable signal
-TENSORBOARD_ENABLED = "enabled"
-TENSORBOARD_ENABLED_DEFAULT = False
-
-# Tensorboard output path
-TENSORBOARD_OUTPUT_PATH = "output_path"
-TENSORBOARD_OUTPUT_PATH_DEFAULT = ""
-
-# Tensorboard job name
-TENSORBOARD_JOB_NAME = "job_name"
-TENSORBOARD_JOB_NAME_DEFAULT = "DeepSpeedJobName"
-
-#########################################
-# Eigenvalue
-#########################################
-# Eigenvalue computation. By default, this feature is not enabled.
-# Users can configure in ds_config.json as below example:
-EIGENVALUE_FORMAT = '''
-Tensorboard can be specified as:
-"eigenvalue": {
-  "enabled": true,
-  "verbose": true,
-  "max_iter": 100,
-  "tol": 1e-2,
-  "stability": 1e-6
-}
-'''
-EIGENVALUE = "eigenvalue"
-
-# Tensorboard enable signal
-EIGENVALUE_ENABLED = "enabled"
-EIGENVALUE_ENABLED_DEFAULT = False
-
-EIGENVALUE_VERBOSE = "verbose"
-EIGENVALUE_VERBOSE_DEFAULT = False
-
-EIGENVALUE_MAX_ITER = "max_iter"
-EIGENVALUE_MAX_ITER_DEFAULT = 100
-
-EIGENVALUE_TOL = "tol"
-EIGENVALUE_TOL_DEFAULT = 1e-2
-
-EIGENVALUE_STABILITY = "stability"
-EIGENVALUE_STABILITY_DEFAULT = 1e-6
-
-EIGENVALUE_GAS_BOUNDARY_RESOLUTION = "gas_boundary_resolution"
-EIGENVALUE_GAS_BOUNDARY_RESOLUTION_DEFAULT = 1
-
-EIGENVALUE_LAYER_NAME = "layer_name"
-EIGENVALUE_LAYER_NAME_DEFAULT = "bert.encoder.layer"
-
-EIGENVALUE_LAYER_NUM = "layer_num"
-EIGENVALUE_LAYER_NUM_DEFAULT = 0
-
-#########################################
-# Progressive Layer Drop (PLD)
-#########################################
-PROGRESSIVE_LAYER_DROP = "progressive_layer_drop"
-
-# PLD enable signal
-PLD_ENABLED = "enabled"
-PLD_ENABLED_DEFAULT = False
-
-PLD_THETA = "theta"
-PLD_THETA_DEFAULT = 1.0
-
-PLD_GAMMA = "gamma"
-PLD_GAMMA_DEFAULT = 0.001
-
-#########################################
-# Curriculum Learning
-#########################################
-CURRICULUM_LEARNING = "curriculum_learning"
-
-CURRICULUM_ENABLED = "enabled"
-CURRICULUM_ENABLED_DEFAULT = False
-
 
 #########################################
 # Validation modes
@@ -386,53 +340,55 @@ class ValidationMode:
 #########################################
 # Checkpoint config params
 #########################################
-# "checkpoint": {tag_validation=["Ignore"|"Warn"|"Fail"]}
+# "checkpoint": {
+#   tag_validation=["Ignore"|"Warn"|"Fail"]
+#   load_universal=false
+#   use_node_local_storage=false
+#   parallel_write: {
+#     pipeline_stage: [True|False]
+#   }
+# }
 CHECKPOINT = "checkpoint"
 CHECKPOINT_TAG_VALIDATION = "tag_validation"
 CHECKPOINT_TAG_VALIDATION_DEFAULT = ValidationMode.WARN
-CHECKPOINT_TAG_VALIDATION_MODES = [
-    ValidationMode.WARN,
-    ValidationMode.IGNORE,
-    ValidationMode.FAIL
-]
+CHECKPOINT_TAG_VALIDATION_MODES = [ValidationMode.WARN, ValidationMode.IGNORE, ValidationMode.FAIL]
+
+LOAD_UNIVERSAL_CHECKPOINT = "load_universal"
+LOAD_UNIVERSAL_CHECKPOINT_DEFAULT = False
+
+USE_NODE_LOCAL_STORAGE_CHECKPOINT = "use_node_local_storage"
+USE_NODE_LOCAL_STORAGE_CHECKPOINT_DEFAULT = False
+
+CHECKPOINT_PARALLEL_WRITE = "parallel_write"
+CHECKPOINT_PARALLEL_WRITE_PIPELINE_STAGE = "pipeline_stage"
+CHECKPOINT_PARALLEL_WRITE_PIPELINE_STAGE_DEFAULT = False
 
 #########################################
-# Quantization
+# Data types config params
 #########################################
-QUANTIZE_TRAINING = "quantize_training"
-QUANTIZE_BITS = "quantize_bits"
-START_BITS = "start_bits"
-TARGET_BITS = "target_bits"
-QUANTIZER_KERNEL = "quantizer_kernel"
-QUANTIZE_SCHEDULE = "quantize_schedule"
-QUANTIZE_PERIOD = "quantize_period"
-SCHEDULE_OFFSET = "schedule_offset"
-QUANTIZE_GROUPS = "quantize_groups"
-FP16_MIXED_QUANTIZE = "fp16_mixed_quantize"
-QUANTIZE_CHANGE_RATIO = "quantize_change_ratio"
-FP16_MIXED_QUANTIZE_ENABLED = "enabled"
-QUANTIZE_VERBOSE = "quantize_verbose"
-QUANTIZE_ALGO = "quantize_algo"
-QUANTIZE_TYPE = "q_type"
-QUANTIZE_SYMMETRIC = "symmetric"
-QUANTIZE_ASYMMETRIC = "asymmetric"
-STOCHASTIC_ROUNDING = "stochastic"
-NEAREST_ROUNDING = "nearest"
-QUANTIZE_ROUNDING = "rounding"
-QUANTIZE_TRAINING_ENABLED = "enabled"
-QUANTIZE_TRAINING_ENABLED_DEFAULT = False
-QUANTIZE_TRAINING_DEFAULT = False
-QUANTIZE_START_BITS_DEFAULT = 16
-QUANTIZE_TARGET_BITS_DEFAULT = 8
-QUANTIZER_KERNEL_DEFAULT = False
-QUANTIZE_PERIOD_DEFAULT = 1000
-QUANTIZE_OFFSET_DEFAULT = 1000
-QUANTIZE_GROUPS_DEFAULT = 1
-QUANTIZE_TYPE_DEFAULT = 0  #symmetric
-QUANTIZE_ROUNDING_DEFAULT = 0  #nearest
-FP16_MIXED_QUANTIZE_ENABLED_DEFAULT = False
-QUANTIZE_CHANGE_RATIO_DEFAULT = 0.001
-QUANTIZE_VERBOSE_DEFAULT = False
+# "data_types": {
+#   grad_accum_dtype=["bf16"|"fp16"|"fp32"]
+#   param_dtype=["bf16"|"fp16"|"fp32"]
+#   buffer_dtype=["bf16"|"fp16"|"fp32"]
+#   keep_in_fp32_modules="auto"|[name patterns]
+#   }
+# }
+# param_dtype and buffer_dtype mirror FSDP's MixedPrecisionPolicy.
+#   - param_dtype: if None uses the specified mixed precision dtype, otherwise casts the params into the provided dtype
+#   - buffer_dtype: if None uses the buffers' dtype found when the model was loaded (e.g. fp32 rotary inv_freq), otherwise casts the buffers into the provided dtype (which is likely to lead to unintended consequences)
+#   - keep_in_fp32_modules: buffers kept in fp32 under bf16/fp16 training; "auto" uses the model's transformers
+#     _keep_in_fp32_modules_strict (and _keep_in_fp32_modules under fp16), a list gives name patterns, [] keeps
+#     nothing. See deepspeed/runtime/keep_in_fp32.py
+
+DATA_TYPES = "data_types"
+GRAD_ACCUM_DTYPE = "grad_accum_dtype"
+GRAD_ACCUM_DTYPE_DEFAULT = None
+PARAM_DTYPE = "param_dtype"
+PARAM_DTYPE_DEFAULT = None
+BUFFER_DTYPE = "buffer_dtype"
+BUFFER_DTYPE_DEFAULT = None
+KEEP_IN_FP32_MODULES = "keep_in_fp32_modules"
+KEEP_IN_FP32_MODULES_DEFAULT = "auto"
 
 #########################################
 # Drop the last incomplete Batch
@@ -445,3 +401,23 @@ The last incomplete batch can be dropped by setting:
 '''
 DATALOADER_DROP_LAST = "dataloader_drop_last"
 DATALOADER_DROP_LAST_DEFAULT = False
+
+#########################################
+# PIPELINE PARALLELISM
+#########################################
+PIPE_REPLICATED = 'ds_pipe_replicated'
+
+#########################################
+# DATA PARALLELISM
+#########################################
+DATA_PARALLEL_GROUP = "data_parallel_group"
+GLOBAL_RANK = "global_rank"
+
+#########################################
+# EXPERT-DATA PARALLELISM TOPO Config
+#########################################
+USE_DATA_BEFORE_EXPERT_PARALLEL = "use_data_before_expert_parallelism"
+USE_DATA_BEFORE_EXPERT_PARALLEL_DEFAULT = False
+
+LOG_LEVEL = "log_level"
+LOG_LEVEL_DEFAULT = None
